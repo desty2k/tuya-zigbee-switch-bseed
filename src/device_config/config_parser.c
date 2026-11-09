@@ -1,462 +1,458 @@
-#include "hal/gpio.h"
-#include "hal/printf_selector.h"
-#include "hal/zigbee.h"
-#include "zigbee/basic_cluster.h"
-#include "zigbee/battery_cluster.h"
-#include "zigbee/consts.h"
-#include "zigbee/cover_cluster.h"
-#include "zigbee/cover_switch_cluster.h"
-#include "zigbee/group_cluster.h"
-#include "zigbee/relay_cluster.h"
-#include "zigbee/poll_control_cluster.h"
-#include "zigbee/switch_cluster.h"
+#include "device_config/config_parser.h"
+#include "device_config/build_features.h"
+#include "base_components/button_input.h"
+#include "base_components/gesture_fsm.h"
+#include "base_components/relay_driver.h"
 
-#include <stdint.h>
+#include <stddef.h>
 #include <string.h>
 
-#include "base_components/led.h"
-#include "base_components/network_indicator.h"
-#include "base_components/battery.h"
-#include "config_nv.h"
-#include "device_config/device_params_nv.h"
-#include "device_config/reset.h"
-#include "hal/system.h"
-#include "hal/zigbee.h"
-#include "hal/zigbee_ota.h"
+/*
+ * 25 ms keeps a 2.5x margin over a 50 Hz half-cycle (10 ms; 8.3 ms at 60 Hz) of
+ * mains pickup on long switch wiring, which otherwise commits as presses, while
+ * adding less press latency than 50 ms. A D<N> token overrides it per device.
+ */
+#define CONFIG_DEFAULT_DEBOUNCE_MS           25
+#define CONFIG_DEFAULT_MULTI_CLICK_GAP_MS    350
 
-// Forward declarations
-void peripherals_init(void);
+/*
+ * A pin is a port letter followed by a decimal index of 0..15 ("C2"); the
+ * characters after it belong to the token (pull suffix, second pin). The HAL
+ * converts the name to its platform pin id and rejects indices above 15 and
+ * pins the chip lacks.
+ */
+static bool parse_pin(const char *text, const char **end, hal_gpio_pin_t *pin) {
+    char           name[4];
+    uint8_t        length = 1;
+    hal_gpio_pin_t parsed;
 
-// extern ota_preamble_t baseEndpoint_otaInfo;
-
-network_indicator_t network_indicator = {
-    .leds                        = { NULL, NULL, NULL, NULL },
-    .has_dedicated_led           = 0,
-    .manual_state_when_connected = 1,
-};
-
-led_t   leds[5];
-uint8_t leds_cnt = 0;
-
-button_t buttons[11];
-uint8_t  buttons_cnt = 0;
-
-relay_t relays[10]; // 4 relay endpoints + 3 cover endpoints
-uint8_t relays_cnt = 0;
-
-zigbee_basic_cluster basic_cluster = {
-    .deviceEnable = 1,
-};
-
-zigbee_group_cluster group_cluster = {};
-
-zigbee_switch_cluster switch_clusters[4];
-uint8_t switch_clusters_cnt = 0;
-
-zigbee_relay_cluster relay_clusters[4];
-uint8_t relay_clusters_cnt = 0;
-
-zigbee_cover_switch_cluster cover_switch_clusters[3];
-uint8_t cover_switch_clusters_cnt = 0;
-
-zigbee_cover_cluster cover_clusters[3];
-uint8_t cover_clusters_cnt = 0;
-
-hal_zigbee_cluster  clusters[32];
-hal_zigbee_endpoint endpoints[10];
-
-uint8_t allow_simultaneous_latching_pulses = 0;
-
-battery_t battery = {
-    .pin         = HAL_INVALID_PIN,
-    .voltage_min =            2000,
-    .voltage_max =            3000,
-};
-
-uint32_t parse_int(const char *s);
-char *seek_until(char *cursor, char needle);
-char *extract_next_entry(char **cursor);
-
-void on_reset_clicked(void *_) {
-    hal_factory_reset();
+    if (text == NULL || text[0] < 'A' || text[0] > 'Z' ||
+        text[1] < '0' || text[1] > '9') {
+        return false;
+    }
+    name[0] = text[0];
+    while (text[length] >= '0' && text[length] <= '9') {
+        if (length >= sizeof(name) - 1) {
+            return false;
+        }
+        name[length] = text[length];
+        length++;
+    }
+    name[length] = '\0';
+    parsed       = hal_gpio_parse_pin(name);
+    if (parsed == HAL_INVALID_PIN) {
+        return false;
+    }
+    *pin = parsed;
+    *end = text + length;
+    return true;
 }
 
-void on_multi_press_reset(void *_, uint8_t press_count) {
-    if (g_multi_press_reset_count != 0 &&
-        press_count >= g_multi_press_reset_count) {
-        hal_factory_reset();
+static bool parse_pull(const char *text, hal_gpio_pull_t *pull) {
+    if (*text == '\0' || (*text == 'f' && text[1] == '\0')) {
+        *pull = HAL_GPIO_PULL_NONE;
+    } else if (*text == 'u' && text[1] == '\0') {
+        *pull = HAL_GPIO_PULL_UP;
+    } else if (*text == 'U' && text[1] == '\0') {
+        *pull = HAL_GPIO_PULL_UP_1M;
+    } else if (*text == 'd' && text[1] == '\0') {
+        *pull = HAL_GPIO_PULL_DOWN;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static bool parse_uint16(const char *text, uint16_t *value) {
+    uint32_t parsed = 0;
+
+    if (*text < '0' || *text > '9') {
+        return false;
+    }
+    while (*text >= '0' && *text <= '9') {
+        parsed = parsed * 10U + (uint32_t)(*text++ - '0');
+        if (parsed > UINT16_MAX) {
+            return false;
+        }
+    }
+    if (*text != '\0') {
+        return false;
+    }
+    *value = (uint16_t)parsed;
+    return true;
+}
+
+/* A mask has at most 4 hex digits (16 relays); a longer one is malformed
+ * rather than cut to its low 16 bits. */
+static bool parse_hex_mask(const char *text, uint16_t *mask,
+                           const char **end) {
+    uint16_t parsed = 0;
+    uint8_t  digits = 0;
+
+    while ((*text >= '0' && *text <= '9') ||
+           (*text >= 'a' && *text <= 'f') ||
+           (*text >= 'A' && *text <= 'F')) {
+        uint8_t digit = *text <= '9' ? (uint8_t)(*text - '0') :
+                        (uint8_t)((*text | 0x20) - 'a' + 10);
+
+        if (++digits > 4) {
+            return false;
+        }
+        parsed = (uint16_t)((parsed << 4) | digit);
+        text++;
+    }
+    *mask = parsed;
+    *end  = text;
+    return digits > 0;
+}
+
+static bool parse_button_token(const char *token, device_composition_t *out,
+                               uint16_t debounce_ms, uint16_t gap_ms) {
+    const char *            end;
+    hal_gpio_pull_t         pull;
+    device_button_config_t *button;
+
+    if (out->button_count >= DEVICE_COMPOSITION_MAX_BUTTONS ||
+        !parse_pin(token + 1, &end, &out->buttons[out->button_count].pin) ||
+        !parse_pull(end, &pull)) {
+        return false;
+    }
+    button  = &out->buttons[out->button_count];
+    *button = (device_button_config_t){
+        .pin                = button->pin,
+        .pull               = pull,
+        .debounce_ms        = debounce_ms,
+        .hold_ms            = token[0] == 'S' ? 800 : 2000,
+        .multi_click_gap_ms = gap_ms,
+        .role               = token[0] == 'S' ? DEVICE_BUTTON_SWITCH : DEVICE_BUTTON_ONBOARD,
+    };
+    if (token[0] == 'S') {
+        if (out->switch_count >= DEVICE_COMPOSITION_MAX_SWITCHES) {
+            return false;
+        }
+        out->switches[out->switch_count] = (device_switch_config_t){
+            .button_id = out->button_count,
+            .relay_id  = out->switch_count,
+        };
+        out->switch_count++;
+    }
+    out->button_count++;
+    return true;
+}
+
+/* X<open><close>[<stop>]<pull>: the optional stop pin stops the cover. */
+static bool parse_cover_switch_token(const char *token,
+                                     device_composition_t *out,
+                                     uint16_t debounce_ms, uint16_t gap_ms) {
+    const char *    end;
+    hal_gpio_pin_t  pins[3];
+    uint8_t         pin_count = 2;
+    hal_gpio_pull_t pull;
+    device_cover_switch_config_t *cover_switch;
+    uint8_t *ids[3];
+
+    if (out->cover_switch_count >= DEVICE_COMPOSITION_MAX_COVER_SWITCHES ||
+        !parse_pin(token + 1, &end, &pins[0]) ||
+        !parse_pin(end, &end, &pins[1])) {
+        return false;
+    }
+    if (parse_pin(end, &end, &pins[2])) {
+        pin_count = 3;
+    }
+    if (!parse_pull(end, &pull) ||
+        out->button_count + pin_count > DEVICE_COMPOSITION_MAX_BUTTONS) {
+        return false;
+    }
+    cover_switch = &out->cover_switches[out->cover_switch_count++];
+    cover_switch->stop_button_id = DEVICE_COMPOSITION_NO_BUTTON;
+    ids[0] = &cover_switch->open_button_id;
+    ids[1] = &cover_switch->close_button_id;
+    ids[2] = &cover_switch->stop_button_id;
+    for (uint8_t i = 0; i < pin_count; i++) {
+        *ids[i] = out->button_count;
+        out->buttons[out->button_count++] = (device_button_config_t){
+            .pin                = pins[i],
+            .pull               = pull,
+            .debounce_ms        = debounce_ms,
+            .hold_ms            = 800,
+            .multi_click_gap_ms = gap_ms,
+            .role               = DEVICE_BUTTON_COVER_SWITCH,
+        };
+    }
+    return true;
+}
+
+/* Whether the code a token instantiates is in this image. */
+static bool token_feature_compiled(const char *token) {
+    if (strcmp(token, "SLP") == 0) {
+        return true;
+    }
+    switch (token[0]) {
+    case 'B':
+        return token[1] != 'T' || FEATURE_BATTERY;
+
+    case 'S':
+        return FEATURE_SWITCH;
+
+    case 'R':
+        return FEATURE_RELAY;
+
+    case 'C':
+    case 'X':
+        return FEATURE_COVER;
+
+    case 'E':
+        return FEATURE_METER;
+
+    case 'K':
+        return FEATURE_INTERLOCK;
+
+    default:
+        return true;
     }
 }
 
-void parse_config() {
-    device_config_read_from_nv();
-    char *cursor = (char *)device_config_str.data;
+static config_parse_result_t parse_token(const char *token,
+                                         device_composition_t *out,
+                                         uint16_t *debounce_ms,
+                                         uint16_t *gap_ms) {
+    const char *   end;
+    hal_gpio_pin_t pin;
 
-    const char *zb_manufacturer = extract_next_entry(&cursor);
-
-    basic_cluster.manuName[0] = strlen(zb_manufacturer);
-    if (basic_cluster.manuName[0] > 31) {
-        printf("Manufacturer too big\r\n");
-        reset_all();
+    if (!token_feature_compiled(token)) {
+        return CONFIG_PARSE_FEATURE_MISSING;
     }
-    memcpy(basic_cluster.manuName + 1, zb_manufacturer,
-           basic_cluster.manuName[0]);
-
-    const char *zb_model = extract_next_entry(&cursor);
-    basic_cluster.modelId[0] = strlen(zb_model);
-    if (basic_cluster.modelId[0] > 31) {
-        printf("Model too big\r\n");
-        reset_all();
-    }
-    memcpy(basic_cluster.modelId + 1, zb_model, basic_cluster.modelId[0]);
-
-    bool     has_dedicated_status_led = false;
-    uint16_t debounce_ms = DEBOUNCE_DELAY_MS;
-    char *   entry;
-    for (entry = extract_next_entry(&cursor); *entry != '\0';
-         entry = extract_next_entry(&cursor)) {
-        if (entry[0] == 'S' && entry[1] == 'L' && entry[2] == 'P') {
-            // Simultaneous Latching Pulses == SLP
-            allow_simultaneous_latching_pulses = 1;
-        } else if (entry[0] == 'D' && entry[1] >= '0' && entry[1] <= '9') {
-            // D<N> sets the global debounce duration in milliseconds.
-            debounce_ms = (uint16_t)parse_int(entry + 1);
-            for (int i = 0; i < buttons_cnt; i++) {
-                buttons[i].debounce_delay_ms = debounce_ms;
-            }
-        } else if (entry[0] == 'B' && entry[1] == 'T') {
-            // Battery: BT<pin>, e.g. BTC5
-            hal_gpio_pin_t pin = hal_gpio_parse_pin(entry + 2);
-            battery.pin = pin;
-            battery_init(&battery);
-        } else if (entry[0] == 'B') {
-            hal_gpio_pin_t  pin  = hal_gpio_parse_pin(entry + 1);
-            hal_gpio_pull_t pull = hal_gpio_parse_pull(entry + 3);
-            hal_gpio_init(pin, 1, pull);
-
-            buttons[buttons_cnt].pin = pin;
-            buttons[buttons_cnt].long_press_duration_ms  = 2000;
-            buttons[buttons_cnt].multi_press_duration_ms = 800;
-            buttons[buttons_cnt].debounce_delay_ms       = debounce_ms;
-            buttons[buttons_cnt].on_long_press           = on_reset_clicked;
-            buttons_cnt++;
-        } else if (entry[0] == 'L') {
-            hal_gpio_pin_t pin = hal_gpio_parse_pin(entry + 1);
-            hal_gpio_init(pin, 0, HAL_GPIO_PULL_NONE);
-            leds[leds_cnt].pin     = pin;
-            leds[leds_cnt].on_high = entry[3] != 'i';
-
-            led_init(&leds[leds_cnt]);
-
-            network_indicator.leds[0]           = &leds[leds_cnt];
-            network_indicator.leds[1]           = NULL;
-            network_indicator.has_dedicated_led = true;
-
-            has_dedicated_status_led = true;
-            leds_cnt++;
-        } else if (entry[0] == 'I') {
-            hal_gpio_pin_t pin = hal_gpio_parse_pin(entry + 1);
-            hal_gpio_init(pin, 0, HAL_GPIO_PULL_NONE);
-            leds[leds_cnt].pin     = pin;
-            leds[leds_cnt].on_high = entry[3] != 'i';
-            led_init(&leds[leds_cnt]);
-
-            for (int index = 0; index < 4; index++) {
-                if (relay_clusters[index].indicator_led == NULL) {
-                    relay_clusters[index].indicator_led = &leds[leds_cnt];
-                    break;
-                }
-            }
-
-            for (int index = 0; index < 4; index++) {
-                if (switch_clusters[index].indicator_led == NULL) {
-                    switch_clusters[index].indicator_led = &leds[leds_cnt];
-                    break;
-                }
-            }
-
-            if (!has_dedicated_status_led) {
-                for (int index = 0; index < 4; index++) {
-                    if (network_indicator.leds[index] == NULL) {
-                        network_indicator.leds[index] = &leds[leds_cnt];
-                        break;
-                    }
-                }
-            }
-            leds_cnt++;
-        } else if (entry[0] == 'S') {
-            hal_gpio_pin_t  pin  = hal_gpio_parse_pin(entry + 1);
-            hal_gpio_pull_t pull = hal_gpio_parse_pull(entry + 3);
-            hal_gpio_init(pin, 1, pull);
-
-            buttons[buttons_cnt].pin = pin;
-            buttons[buttons_cnt].long_press_duration_ms  = 800;
-            buttons[buttons_cnt].multi_press_duration_ms = 800;
-            buttons[buttons_cnt].debounce_delay_ms       = debounce_ms;
-            buttons[buttons_cnt].on_multi_press          = on_multi_press_reset;
-
-            if (entry[3] == 'd')
-                buttons[buttons_cnt].pressed_when_high = 1;
-            switch_clusters[switch_clusters_cnt].switch_idx = switch_clusters_cnt;
-            switch_clusters[switch_clusters_cnt].mode       =
-                ZCL_ONOFF_CONFIGURATION_SWITCH_TYPE_TOGGLE;
-            switch_clusters[switch_clusters_cnt].action =
-                ZCL_ONOFF_CONFIGURATION_SWITCH_ACTION_TOGGLE_SIMPLE;
-            switch_clusters[switch_clusters_cnt].relay_mode =
-                ZCL_ONOFF_CONFIGURATION_RELAY_MODE_SHORT;
-            switch_clusters[switch_clusters_cnt].binded_mode =
-                ZCL_ONOFF_CONFIGURATION_BINDED_MODE_SHORT;
-            switch_clusters[switch_clusters_cnt].relay_index     = switch_clusters_cnt + 1;
-            switch_clusters[switch_clusters_cnt].button          = &buttons[buttons_cnt];
-            switch_clusters[switch_clusters_cnt].level_move_rate = 50;
-            buttons_cnt++;
-            switch_clusters_cnt++;
-        } else if (entry[0] == 'R') {
-            hal_gpio_pin_t pin = hal_gpio_parse_pin(entry + 1);
-            hal_gpio_init(pin, 0, HAL_GPIO_PULL_NONE);
-
-            relays[relays_cnt].pin     = pin;
-            relays[relays_cnt].on_high = 1;
-
-            if (entry[3] != '\0') {
-                pin = hal_gpio_parse_pin(entry + 3);
-                hal_gpio_init(pin, 0, HAL_GPIO_PULL_NONE);
-                relays[relays_cnt].off_pin     = pin;
-                relays[relays_cnt].is_latching = 1;
-            }
-
-            relay_clusters[relay_clusters_cnt].relay_idx = relay_clusters_cnt;
-            relay_clusters[relay_clusters_cnt].relay     = &relays[relays_cnt];
-
-            relays_cnt++;
-            relay_clusters_cnt++;
-        } else if (entry[0] == 'X') {
-            hal_gpio_pin_t  open_pin  = hal_gpio_parse_pin(entry + 1);
-            hal_gpio_pin_t  close_pin = hal_gpio_parse_pin(entry + 3);
-            hal_gpio_pull_t pull      = hal_gpio_parse_pull(entry + 5);
-
-            hal_gpio_init(open_pin, 1, pull);
-            hal_gpio_init(close_pin, 1, pull);
-
-            buttons[buttons_cnt].pin = open_pin;
-            buttons[buttons_cnt].long_press_duration_ms  = 800;
-            buttons[buttons_cnt].multi_press_duration_ms = 800;
-            buttons[buttons_cnt].debounce_delay_ms       = debounce_ms;
-            buttons[buttons_cnt].on_multi_press          = on_multi_press_reset;
-            button_t *open_button = &buttons[buttons_cnt++];
-
-            buttons[buttons_cnt].pin = close_pin;
-            buttons[buttons_cnt].long_press_duration_ms  = 800;
-            buttons[buttons_cnt].multi_press_duration_ms = 800;
-            buttons[buttons_cnt].debounce_delay_ms       = debounce_ms;
-            buttons[buttons_cnt].on_multi_press          = on_multi_press_reset;
-            button_t *close_button = &buttons[buttons_cnt++];
-
-            cover_switch_clusters[cover_switch_clusters_cnt].open_button =
-                open_button;
-            cover_switch_clusters[cover_switch_clusters_cnt].close_button =
-                close_button;
-            cover_switch_clusters[cover_switch_clusters_cnt].cover_switch_idx =
-                cover_switch_clusters_cnt;
-            cover_switch_clusters_cnt++;
-        } else if (entry[0] == 'C') {
-            hal_gpio_pin_t open_pin  = hal_gpio_parse_pin(entry + 1);
-            hal_gpio_pin_t close_pin = hal_gpio_parse_pin(entry + 3);
-
-            hal_gpio_init(open_pin, 0, HAL_GPIO_PULL_NONE);
-            hal_gpio_init(close_pin, 0, HAL_GPIO_PULL_NONE);
-
-            relays[relays_cnt].pin         = open_pin;
-            relays[relays_cnt].on_high     = 1;
-            relays[relays_cnt].is_latching = 0;
-            relay_t *open_relay = &relays[relays_cnt++];
-
-            relays[relays_cnt].pin         = close_pin;
-            relays[relays_cnt].on_high     = 1;
-            relays[relays_cnt].is_latching = 0;
-            relay_t *close_relay = &relays[relays_cnt++];
-
-            cover_clusters[cover_clusters_cnt].open_relay  = open_relay;
-            cover_clusters[cover_clusters_cnt].close_relay = close_relay;
-            cover_clusters[cover_clusters_cnt].cover_idx   = cover_clusters_cnt;
-            cover_clusters_cnt++;
-        } else if (entry[0] == 'i') {
-            uint32_t image_type = parse_int(entry + 1);
-            hal_zigbee_set_image_type(image_type);
-        } else if (entry[0] == 'M') {
-            for (int index = 0; index < switch_clusters_cnt; index++) {
-                switch_clusters[index].mode =
-                    ZCL_ONOFF_CONFIGURATION_SWITCH_TYPE_MOMENTARY;
-            }
+    if (strcmp(token, "SLP") == 0) {
+        out->simultaneous_latching_pulses = true;
+    } else if (token[0] == 'D') {
+        if (!parse_uint16(token + 1, debounce_ms) ||
+            *debounce_ms < BUTTON_DEBOUNCE_MIN_MS ||
+            *debounce_ms > BUTTON_DEBOUNCE_MAX_MS) {
+            return CONFIG_PARSE_SYNTAX;
         }
-    }
-
-    peripherals_init();
-
-    printf("Initializing Zigbee with %d switches, %d relays, %d cover switches, "
-           "%d covers\r\n",
-           switch_clusters_cnt, relay_clusters_cnt, cover_switch_clusters_cnt,
-           cover_clusters_cnt);
-
-    uint8_t total_endpoints = switch_clusters_cnt + relay_clusters_cnt +
-                              cover_switch_clusters_cnt + cover_clusters_cnt;
-
-    hal_zigbee_cluster *cluster_ptr = clusters;
-
-    for (int index = 0; index < switch_clusters_cnt; index++) {
-        if (switch_clusters[index].relay_index > relay_clusters_cnt) {
-            // Detach switches that point past the available relay count.
-            switch_clusters[index].relay_mode =
-                ZCL_ONOFF_CONFIGURATION_RELAY_MODE_DETACHED;
-            switch_clusters[index].relay_index = 0;
+    } else if (token[0] == 'G') {
+        if (!parse_uint16(token + 1, gap_ms) ||
+            *gap_ms < GESTURE_MULTI_CLICK_GAP_MIN_MS ||
+            *gap_ms > GESTURE_MULTI_CLICK_GAP_MAX_MS) {
+            return CONFIG_PARSE_SYNTAX;
         }
-    }
+    } else if (strcmp(token, "M") == 0) {
+        out->momentary_switches = true;
+    } else if (token[0] == 'i') {
+        if (!parse_uint16(token + 1, &out->image_type)) {
+            return CONFIG_PARSE_SYNTAX;
+        }
+        out->has_image_type = true;
+    } else if (token[0] == 'K') {
+        uint16_t mask;
+        uint16_t dead_time_ms = DEVICE_COMPOSITION_DEFAULT_DEAD_TIME_MS;
 
-    // special case when no switches or relays are defined, so we can init a
-    // "clean" device and configure it while running endpoint 1 still needs to be
-    // initialised even though wenn no switches or relays are defined, so it can
-    // join the network!
-    if (total_endpoints == 0)
-        total_endpoints = 1;
+        if (!parse_hex_mask(token + 1, &mask, &end) ||
+            (*end != '\0' && (*end != ':' || !parse_uint16(end + 1, &dead_time_ms)))) {
+            return CONFIG_PARSE_SYNTAX;
+        }
+        if (out->interlock_count >= DEVICE_COMPOSITION_MAX_INTERLOCKS) {
+            return CONFIG_PARSE_LIMIT;
+        }
+        if (mask != 0) {
+            out->interlocks[out->interlock_count++] = (device_interlock_config_t){
+                .relay_mask   = mask,
+                .dead_time_ms = dead_time_ms,
+            };
+        }
+    } else if (token[0] == 'B' && token[1] == 'T') {
+        if (!parse_pin(token + 2, &end, &out->battery_pin) || *end != '\0') {
+            return CONFIG_PARSE_SYNTAX;
+        }
+    } else if (token[0] == 'B' || token[0] == 'S') {
+        if (out->button_count >= DEVICE_COMPOSITION_MAX_BUTTONS ||
+            (token[0] == 'S' &&
+             out->switch_count >= DEVICE_COMPOSITION_MAX_SWITCHES)) {
+            return CONFIG_PARSE_LIMIT;
+        }
+        if (!parse_button_token(token, out, *debounce_ms, *gap_ms)) {
+            return CONFIG_PARSE_SYNTAX;
+        }
+    } else if (token[0] == 'P') {
+        if (out->lock_led_pin != HAL_INVALID_PIN) {
+            return CONFIG_PARSE_LIMIT;
+        }
+        if (!parse_pin(token + 1, &end, &pin) ||
+            (*end != '\0' && strcmp(end, "i") != 0)) {
+            return CONFIG_PARSE_SYNTAX;
+        }
+        out->lock_led_pin     = pin;
+        out->lock_led_on_high = strcmp(end, "i") != 0;
+    } else if (token[0] == 'L' && token[1] == 'P') {
+        // No pin port is named P, so LP never starts an LED token.
+        if (!parse_uint16(token + 2, &out->latching_pulse_ms) ||
+            out->latching_pulse_ms < RELAY_LATCH_PULSE_MIN_MS ||
+            out->latching_pulse_ms > RELAY_LATCH_PULSE_MAX_MS) {
+            return CONFIG_PARSE_SYNTAX;
+        }
+    } else if (token[0] == 'L' || token[0] == 'I') {
+        device_indicator_config_t *indicator;
 
-    for (int index = 0; index < total_endpoints; index++) {
-        endpoints[index].endpoint   = index + 1;
-        endpoints[index].profile_id = 0x0104;
-        endpoints[index].device_id  = 0xffff;
-    }
+        if (out->indicator_count >= DEVICE_COMPOSITION_MAX_INDICATORS ||
+            !parse_pin(token + 1, &end, &pin) ||
+            (*end != '\0' && strcmp(end, "i") != 0)) {
+            return CONFIG_PARSE_LIMIT;
+        }
+        indicator  = &out->indicators[out->indicator_count++];
+        *indicator = (device_indicator_config_t){
+            .pin       = pin,
+            .on_high   = strcmp(end, "i") != 0,
+            .dedicated = token[0] == 'L',
+        };
+    } else if (token[0] == 'R') {
+        device_relay_config_t *relay;
 
-    endpoints[0].clusters = cluster_ptr;
-    basic_cluster_add_to_endpoint(&basic_cluster, &endpoints[0]);
+        if (out->relay_count >= DEVICE_COMPOSITION_MAX_RELAYS ||
+            out->relay_endpoint_count >= DEVICE_COMPOSITION_MAX_RELAYS ||
+            !parse_pin(token + 1, &end, &pin)) {
+            return CONFIG_PARSE_LIMIT;
+        }
+        relay  = &out->relays[out->relay_count];
+        *relay = (device_relay_config_t){ .on_pin  = pin,
+                                          .off_pin = HAL_INVALID_PIN };
+        if (*end != '\0') {
+            if (!parse_pin(end, &end, &relay->off_pin) || *end != '\0') {
+                return CONFIG_PARSE_SYNTAX;
+            }
+            relay->is_latching = true;
+        }
+        out->relay_endpoint_ids[out->relay_endpoint_count++] = out->relay_count++;
+    } else if (token[0] == 'X') {
+        if (out->cover_switch_count >= DEVICE_COMPOSITION_MAX_COVER_SWITCHES ||
+            out->button_count + 2 > DEVICE_COMPOSITION_MAX_BUTTONS) {
+            return CONFIG_PARSE_LIMIT;
+        }
+        if (!parse_cover_switch_token(token, out, *debounce_ms, *gap_ms)) {
+            return CONFIG_PARSE_SYNTAX;
+        }
+    } else if (token[0] == 'C') {
+        device_cover_config_t *cover;
+        hal_gpio_pin_t         open_pin;
+        hal_gpio_pin_t         close_pin;
 
-    hal_ota_cluster_setup(&endpoints[0].clusters[endpoints[0].cluster_count]);
-    endpoints[0].cluster_count++;
+        if (out->cover_count >= DEVICE_COMPOSITION_MAX_COVERS ||
+            out->relay_count + 2 > DEVICE_COMPOSITION_MAX_RELAYS ||
+            !parse_pin(token + 1, &end, &open_pin) ||
+            !parse_pin(end, &end, &close_pin) || *end != '\0') {
+            return CONFIG_PARSE_LIMIT;
+        }
+        cover = &out->covers[out->cover_count++];
+        cover->open_relay_id              = out->relay_count++;
+        cover->close_relay_id             = out->relay_count++;
+        out->relays[cover->open_relay_id] = (device_relay_config_t){
+            .on_pin  = open_pin,
+            .off_pin = HAL_INVALID_PIN,
+        };
+        out->relays[cover->close_relay_id] = (device_relay_config_t){
+            .on_pin  = close_pin,
+            .off_pin = HAL_INVALID_PIN,
+        };
+#if FEATURE_METER
+    } else if (token[0] == 'E') {
+        device_meter_config_t *meter;
 
-    // Add battery cluster for battery-powered devices
-    if (battery.pin != HAL_INVALID_PIN) {
-        static zigbee_battery_cluster battery_cluster;
-        battery_cluster_add_to_endpoint(&battery_cluster, &endpoints[0]);
-    }
-
-#ifdef END_DEVICE
-    // Add poll control cluster for end devices
-    static zigbee_poll_control_cluster poll_ctrl_cluster;
-    poll_control_cluster_add_to_endpoint(&poll_ctrl_cluster, &endpoints[0],
-                                         battery.pin != HAL_INVALID_PIN);
+        if (out->meter_count >= DEVICE_COMPOSITION_MAX_METERS) {
+            return CONFIG_PARSE_LIMIT;
+        }
+        meter = &out->meters[out->meter_count];
+        // E<ic><CF><CF1><SEL>[i]; IC B is the BL0937, `i` makes SEL low
+        // select voltage.
+        if (token[1] != 'B' || !parse_pin(token + 2, &end, &meter->cf_pin) ||
+            !parse_pin(end, &end, &meter->cf1_pin) ||
+            !parse_pin(end, &end, &meter->sel_pin) ||
+            (*end != '\0' && strcmp(end, "i") != 0)) {
+            return CONFIG_PARSE_SYNTAX;
+        }
+        meter->ic = DEVICE_METER_BL0937;
+        meter->sel_high_selects_voltage = *end == '\0';
+        out->meter_count++;
 #endif
-
-    for (int index = 0; index < switch_clusters_cnt; index++) {
-        if (index != 0) {
-            cluster_ptr += endpoints[index - 1].cluster_count;
-            endpoints[index].clusters = cluster_ptr;
-        }
-        switch_cluster_add_to_endpoint(&switch_clusters[index], &endpoints[index]);
-    }
-    for (int index = 0; index < relay_clusters_cnt; index++) {
-        if (switch_clusters_cnt + index != 0) {
-            cluster_ptr += endpoints[switch_clusters_cnt + index - 1].cluster_count;
-            endpoints[switch_clusters_cnt + index].clusters = cluster_ptr;
-        }
-        relay_cluster_add_to_endpoint(&relay_clusters[index],
-                                      &endpoints[switch_clusters_cnt + index]);
-        // Group cluster is stateless, safe to add to multiple endpoints
-        group_cluster_add_to_endpoint(&group_cluster,
-                                      &endpoints[switch_clusters_cnt + index]);
-    }
-
-    int cover_switch_base = switch_clusters_cnt + relay_clusters_cnt;
-    for (int index = 0; index < cover_switch_clusters_cnt; index++) {
-        if (cover_switch_base + index != 0) {
-            cluster_ptr += endpoints[cover_switch_base + index - 1].cluster_count;
-            endpoints[cover_switch_base + index].clusters = cluster_ptr;
-        }
-        cover_switch_cluster_add_to_endpoint(&cover_switch_clusters[index],
-                                             &endpoints[cover_switch_base + index]);
-    }
-
-    int cover_base =
-        switch_clusters_cnt + relay_clusters_cnt + cover_switch_clusters_cnt;
-    for (int index = 0; index < cover_clusters_cnt; index++) {
-        if (cover_base + index != 0) {
-            cluster_ptr += endpoints[cover_base + index - 1].cluster_count;
-            endpoints[cover_base + index].clusters = cluster_ptr;
-        }
-        cover_cluster_add_to_endpoint(&cover_clusters[index],
-                                      &endpoints[cover_base + index]);
-    }
-
-    hal_zigbee_init(endpoints, total_endpoints);
-    while (cursor != (char *)device_config_str.data) {
-        cursor--;
-        if (*cursor == '\0') {
-            *cursor = ';';
-        }
-    }
-
-    printf("Config parsed successfully\r\n");
-}
-
-void network_indicator_on_network_status_change(
-    hal_zigbee_network_status_t new_status) {
-    printf("Network status changed to %d\r\n", new_status);
-    if (new_status == HAL_ZIGBEE_NETWORK_JOINED) {
-        if (battery.pin != HAL_INVALID_PIN) {
-            network_indicator.manual_state_when_connected = 0;
-        }
-        network_indicator_connected(&network_indicator);
-        update_switch_clusters();
-        update_relay_clusters();
     } else {
-        network_indicator_not_connected(&network_indicator);
+        return CONFIG_PARSE_SYNTAX;
     }
+    return CONFIG_PARSE_OK;
 }
 
-void peripherals_init() {
-    for (int index = 0; index < buttons_cnt; index++) {
-        btn_init(&buttons[index]);
-    }
-    for (int index = 0; index < leds_cnt; index++) {
-        led_init(&leds[index]);
-    }
-    for (int index = 0; index < relays_cnt; index++) {
-        relay_init(&relays[index]);
-    }
-    if (hal_zigbee_get_network_status() == HAL_ZIGBEE_NETWORK_JOINED) {
-        network_indicator_connected(&network_indicator);
-        update_switch_clusters();
-        update_relay_clusters();
-    } else {
-        network_indicator_not_connected(&network_indicator);
-    }
-    hal_register_on_network_status_change_callback(
-        network_indicator_on_network_status_change);
-}
+config_parse_result_t config_parser_parse(const char *text,
+                                          device_composition_t *out) {
+    const char *cursor = text;
+    const char *end;
+    uint16_t    debounce_ms = CONFIG_DEFAULT_DEBOUNCE_MS;
+    uint16_t    gap_ms      = CONFIG_DEFAULT_MULTI_CLICK_GAP_MS;
 
-// Helper functions
-
-char *seek_until(char *cursor, char needle) {
-    while (*cursor != needle && *cursor != '\0') {
-        cursor++;
+    if (out == NULL) {
+        return CONFIG_PARSE_SYNTAX;
     }
-    return(cursor);
-}
-
-char *extract_next_entry(char **cursor) {
-    char *end = seek_until(*cursor, ';');
-
-    *end = '\0';
-    char *res = *cursor;
-    *cursor = end + 1;
-    return(res);
-}
-
-uint32_t parse_int(const char *s) {
-    if (!s)
-        return 0;
-
-    uint32_t n = 0;
-    while (*s >= '0' && *s <= '9') {
-        n = n * 10 + (uint32_t)(*s - '0');
-        s++;
+    memset(out, 0, sizeof(*out));
+    out->battery_pin  = HAL_INVALID_PIN;
+    out->lock_led_pin = HAL_INVALID_PIN;
+    if (text == NULL) {
+        goto syntax;
     }
-    return n;
+    for (uint8_t field = 0; field < 2; field++) {
+        size_t length;
+        char * destination = field == 0 ? out->manufacturer : out->model;
+        size_t capacity    = field == 0 ? sizeof(out->manufacturer) :
+                             sizeof(out->model);
+
+        end = cursor;
+        while (*end != '\0' && *end != ';') {
+            end++;
+        }
+        length = (size_t)(end - cursor);
+        if (*end != ';' || length >= capacity) {
+            goto syntax;
+        }
+        memcpy(destination, cursor, length);
+        cursor = end + 1;
+    }
+    while (*cursor != '\0') {
+        char   token[32];
+        size_t length;
+        config_parse_result_t result;
+
+        end = cursor;
+        while (*end != '\0' && *end != ';') {
+            end++;
+        }
+        length = (size_t)(end - cursor);
+        if (length == 0 || length >= sizeof(token)) {
+            goto syntax;
+        }
+        memcpy(token, cursor, length);
+        token[length] = '\0';
+        cursor        = *end == ';' ? end + 1 : end;
+        result        = parse_token(token, out, &debounce_ms, &gap_ms);
+        if (result != CONFIG_PARSE_OK) {
+            memset(out, 0, sizeof(*out));
+            return result;
+        }
+    }
+    for (uint8_t i = 0; i < out->button_count; i++) {
+        out->buttons[i].debounce_ms        = debounce_ms;
+        out->buttons[i].multi_click_gap_ms = gap_ms;
+    }
+    out->endpoint_count = (uint8_t)(out->switch_count +
+                                    out->relay_endpoint_count +
+                                    out->cover_switch_count + out->cover_count);
+    if (out->endpoint_count == 0) {
+        out->endpoint_count = 1;
+    }
+    {
+        config_parse_result_t result = device_composition_validate(out);
+
+        if (result != CONFIG_PARSE_OK) {
+            memset(out, 0, sizeof(*out));
+        }
+        return result;
+    }
+
+syntax:
+    memset(out, 0, sizeof(*out));
+    return CONFIG_PARSE_SYNTAX;
 }

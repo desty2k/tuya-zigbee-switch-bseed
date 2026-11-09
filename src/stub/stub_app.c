@@ -3,12 +3,16 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "base_components/button.h"
+#include "base_components/button_dispatcher.h"
+#include "base_components/button_input.h"
+#include "base_components/gesture_fsm.h"
 #include "base_components/led.h"
 #include "base_components/network_indicator.h"
-#include "base_components/relay.h"
+#include "base_components/relay_controller.h"
+#include "base_components/relay_driver.h"
+#include "device_config/build_features.h"
 #include "device_config/config_nv.h"
-#include "device_config/config_parser.h"
+#include "device_config/feature_wiring.h"
 #include "device_config/nvm_items.h"
 #include "hal/gpio.h"
 #include "hal/nvm.h"
@@ -18,22 +22,37 @@
 #include "stub/hal/stub.h"
 #include "stub/machine_io.h"
 #include "zigbee/basic_cluster.h"
-#include "zigbee/consts.h"
-#include "zigbee/general_commands.h"
+#include "zigbee/zcl_types.h"
 #include "zigbee/relay_cluster.h"
 #include "zigbee/switch_cluster.h"
 
-// externs from your codebase
-extern led_t    leds[5];
-extern uint8_t  leds_cnt;
-extern button_t buttons[5];
-extern uint8_t  buttons_cnt;
-extern relay_t  relays[5];
-extern uint8_t  relays_cnt;
 
 static device_config_str_t g_stub_config = {
     .size = 0, .data = "Stub;Stub;SA0u;SA1u;SA2u;SA3u;RB0;RB1;RC0;RC1;"
 };
+
+static void stub_button_event(const button_event_t *event, void *arg) {
+    (void)arg;
+    io_evt("btn_event id=%u type=%s seq=%u press_id=%u t=%u now=%u",
+           event->button_id,
+           event->type == BUTTON_EVENT_DOWN ? "DOWN" : "UP", event->seq,
+           event->press_id, event->timestamp_ms, hal_millis());
+}
+
+static void stub_gesture_event(const gesture_event_t *event, void *arg) {
+    const char *type = "N_CLICK";
+
+    (void)arg;
+    if (event->type == GESTURE_HOLD_START) {
+        type = "HOLD_START";
+    } else if (event->type == GESTURE_HOLD_END) {
+        type = "HOLD_END";
+    }
+    io_evt("gesture id=%u type=%s count=%u duration=%u press_id=%u t=%u "
+           "now=%u",
+           event->button_id, type, event->count, event->duration_ms,
+           event->press_id, event->timestamp_ms, hal_millis());
+}
 
 void stub_app_init(const char *device_conf, bool joined) {
     puts("[STUB] Starting Smart Home Device Stub");
@@ -68,6 +87,8 @@ void stub_app_init(const char *device_conf, bool joined) {
     }
 
     app_init();
+    button_dispatcher_register(stub_button_event, NULL);
+    gesture_fsm_register_sink(stub_gesture_event, NULL);
 
     puts("[STUB] Application initialized");
 }
@@ -89,18 +110,40 @@ void stub_app_print_help(void) {
     puts("  machine on|off                        - Set machine mode");
     puts("  help                                  - Show this help");
     puts("  s, status                             - Show device status");
+    puts("  diag                                  - Show diagnostic counters");
     puts(
         "  net                                   - Toggle network joined status");
+    puts("  tx_fail <count>                       - Reject coordinator sends");
+    puts("  announce_fail <count>                 - Reject announce attempts");
+    puts("  rand_seed <seed>                      - Restart the random source");
     puts("  set_pin <pin> <0|1>                   - Simulate GPIO input");
+    puts("  pin_edge <pin> <0|1> [after_ms]       - Queue GPIO edge");
     puts("  read_pin <pin>                        - Read GPIO output");
+    puts("  pin_state <pin>                       - GPIO direction, pull and level");
     puts("  zcl_list_attrs                        - List all Zigbee attributes");
     puts("  zcl_read <ep> <cluster> <attr>        - Read attribute (ep dec, IDs "
          "hex)");
     puts("  zcl_write <ep> <cluster> <attr> <v>   - Write attribute (v dec/hex)");
+    puts("  zcl_write_raw <ep> <cluster> <attr> <hex> - Write raw attribute bytes");
+    puts("  zcl_attr_callback <ep> <cluster> <attr> - Inject an attribute callback");
     puts("  zcl_cmd <ep> <cluster> <cmd> [bytes]  - Simulate ZCL command (hex "
          "bytes)");
     puts("  freeze_time <0|1>                     - Freeze/unfreeze time");
     puts("  step_time <ms>                        - Advance time by ms");
+    puts("  time_advance <ms>                     - Advance without tasks");
+    puts("  tasks_poll                            - Dispatch due tasks");
+    puts("  time_model native|telink              - Select hal_millis wrap model");
+    puts("  time_set <virtual_ms>                 - Jump frozen time forward");
+    puts("  pin_burst <pin> <count>               - Toggle input count times");
+    puts("  pin_late <pin> <0|1> <lag_ms>         - Edge stamped lag_ms late");
+    puts("  task_fail <count>                     - Reject task schedules");
+    puts("  input_diag                            - Input scheduling counters");
+#if FEATURE_PROBE
+    puts(
+        "  probe_pin <pin> float|high|low|train <period_us> <high_us>|base <base_ohm> <pull_in_ua>");
+    puts("                                        - Electrical model of a probe pin");
+    puts("  probe_pin_info <pin>                  - Probe pin model state");
+#endif
     puts("  q, quit                               - Exit");
 }
 
@@ -113,16 +156,14 @@ void stub_app_show_status(void) {
     }
     for (uint8_t i = 0; i < relays_cnt; i++) {
         printf("Relay %u: %s (pin %d = %d)\n", (unsigned)i,
-               relays[i].on ? "ON" : "OFF", relays[i].pin,
-               stub_gpio_get_output(relays[i].pin));
+               relay_ctrl_is_on(i) ? "ON" : "OFF", relay_drivers[i].on_pin,
+               stub_gpio_get_output(relay_drivers[i].on_pin));
     }
     for (uint8_t i = 0; i < buttons_cnt; i++) {
-        const char *state = (buttons[i].pressed && buttons[i].long_pressed)
-                            ? "LONG PRESSED"
-                        : buttons[i].pressed ? "PRESSED"
-                                             : "RELEASED";
-        printf("Button %u: %s (pin %d state: %d)\n", (unsigned)i, state,
-               buttons[i].pin, stub_gpio_get_output(buttons[i].pin));
+        const char *state = gesture_fsm_hold_active(i) ? "LONG PRESSED"
+                            : button_input_is_down(i) ? "PRESSED"
+                                                      : "RELEASED";
+        printf("Button %u: %s\n", (unsigned)i, state);
     }
     if (hal_zigbee_get_network_status() == HAL_ZIGBEE_NETWORK_JOINED) {
         puts("Network: JOINED\n");
@@ -169,6 +210,7 @@ const char *stub_app_attribute_value_to_string(hal_zigbee_attribute *attr,
         }
         break;
     case ZCL_DATA_TYPE_UINT32:
+    case ZCL_DATA_TYPE_BITMAP32:
         if (attr->size >= 4) {
             uint32_t val = (uint32_t)attr->value[0] |
                            ((uint32_t)attr->value[1] << 8) |
@@ -179,6 +221,36 @@ const char *stub_app_attribute_value_to_string(hal_zigbee_attribute *attr,
             buf[0] = '\0';
         }
         break;
+    case ZCL_DATA_TYPE_INT16:
+        if (attr->size >= 2) {
+            int16_t val = (int16_t)(attr->value[0] | (attr->value[1] << 8));
+            snprintf(buf, bufsize, "%d", val);
+        } else {
+            buf[0] = '\0';
+        }
+        break;
+    case ZCL_DATA_TYPE_UINT24:
+    case ZCL_DATA_TYPE_UINT48: {
+        unsigned long long val = 0;
+
+        for (int i = attr->size - 1; i >= 0; i--) {
+            val = (val << 8) | attr->value[i];
+        }
+        snprintf(buf, bufsize, "%llu", val);
+        break;
+    }
+    case ZCL_DATA_TYPE_OCTET_STR: {
+        size_t  n   = 0;
+        uint8_t len = attr->size >= 1 ? attr->value[0] : 0;
+
+        if (len > attr->size - 1)
+            len = attr->size - 1;
+        buf[0] = '\0';
+        for (uint8_t i = 0; i < len && n + 3 <= bufsize; i++) {
+            n += snprintf(buf + n, bufsize - n, "%02x", attr->value[1 + i]);
+        }
+        break;
+    }
     case ZCL_DATA_TYPE_CHAR_STR: {
         if (attr->size >= 1) {
             uint8_t len = attr->value[0];
@@ -221,7 +293,7 @@ int stub_app_string_to_attribute_value(hal_zigbee_attribute *attr,
     if (!attr || !attr->value || !str)
         return -1;
 
-    if (attr->flag == ATTR_READONLY) {
+    if (attr->flag == HAL_ATTR_READ) {
         io_log("ZIGBEE", "Warning: Writing to read-only attribute\n");
     }
 
@@ -253,7 +325,8 @@ int stub_app_string_to_attribute_value(hal_zigbee_attribute *attr,
 
         break;
     }
-    case ZCL_DATA_TYPE_UINT32: {
+    case ZCL_DATA_TYPE_UINT32:
+    case ZCL_DATA_TYPE_BITMAP32: {
         unsigned long v = 0;
         if (sscanf(str, "%lu", &v) != 1)
             return -2;
@@ -347,7 +420,7 @@ void stub_app_list_attrs(void) {
         for (int j = 0; j < endpoints[i].cluster_count; j++) {
             hal_zigbee_cluster *cluster = &endpoints[i].clusters[j];
             printf("  Cluster 0x%04x (%s):\n", cluster->cluster_id,
-                   cluster->is_server ? "server" : "client");
+                   cluster->role == HAL_ZIGBEE_ROLE_SERVER ? "server" : "client");
 
             for (int k = 0; k < cluster->attribute_count; k++) {
                 hal_zigbee_attribute *attr = &cluster->attributes[k];

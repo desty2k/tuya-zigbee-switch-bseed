@@ -1,18 +1,33 @@
 from typing import Final
 
 from zhaquirks import CustomCluster
-from zigpy.quirks.v2 import QuirkBuilder, ReportingConfig, SensorDeviceClass, EntityType
-from zigpy.zcl import ClusterType, foundation
-from zigpy.zcl.clusters.general import OnOffConfiguration, SwitchType, MultistateInput, OnOff, Basic
+from zhaquirks.const import (
+    CLUSTER_ID,
+    COMMAND,
+    DOUBLE_PRESS,
+    ENDPOINT_ID,
+    LONG_PRESS,
+    LONG_RELEASE,
+    QUADRUPLE_PRESS,
+    SHORT_PRESS,
+    SHORT_RELEASE,
+    TRIPLE_PRESS,
+    ZHA_SEND_EVENT,
+)
+from zigpy.quirks.v2 import EntityPlatform, QuirkBuilder, ReportingConfig, SensorDeviceClass, EntityType
+from zigpy.zcl import AttributeUpdatedEvent, ClusterType, foundation
+from zigpy.zcl.clusters.general import OnOffConfiguration, SwitchType, MultistateInput, OnOff
 from zigpy.zcl.clusters.closures import WindowCovering
-from zigpy.zcl.foundation import ZCLAttributeDef
+from zigpy.zcl.foundation import ZCLAttributeDef, ZCLCommandDef
 import zigpy.types as t
+{% include "management_protocol.py.jinja" %}
 
 class RelayMode(t.enum8):
     Detached = 0x00
     PressStart = 0x01
     LongPress = 0x02
     ShortPress = 0x03
+    DeferredSingle = 0x04
 
 class BindedMode(t.enum8):
     PressStart = 0x01
@@ -97,29 +112,196 @@ class CustomMultistateInputCluster(CustomCluster, MultistateInput):
 
     class AttributeDefs(foundation.BaseAttributeDefs):
         present_value: Final = ZCLAttributeDef(
-            id=0x0055, type=t.uint16_t, access="r*w", mandatory=True
+            id=0x0055, type=t.uint16_t, access="rp", mandatory=True
         )
         cluster_revision: Final = foundation.ZCL_CLUSTER_REVISION_ATTR
         reporting_status: Final = foundation.ZCL_REPORTING_STATUS_ATTR
 
 
-class CustomBasicCluster(CustomCluster, Basic):
+def management_attribute_defs(attributes):
+    """AttributeDefs for a management cluster from its generated attribute table."""
+    defs = {
+        name: ZCLAttributeDef(id=attr_id, type=kind, access=access, is_manufacturer_specific=True)
+        for attr_id, name, kind, access in attributes
+    }
+    defs["cluster_revision"] = foundation.ZCL_CLUSTER_REVISION_ATTR
+    defs["reporting_status"] = foundation.ZCL_REPORTING_STATUS_ATTR
+    return type("AttributeDefs", (foundation.BaseAttributeDefs,), defs)
+
+
+class DeviceConfigCluster(CustomCluster):
+    cluster_id = MANAGEMENT_PROTOCOL["device_config"]
+    name = "Device Config"
+    ep_attribute = "device_config"
+    manufacturer_id_override = MANAGEMENT_PROTOCOL["manufacturer_code"]
+    AttributeDefs = management_attribute_defs(DEVICE_CONFIG_ATTRIBUTES)
+
+
+class DeviceDiagnosticsCluster(CustomCluster):
+    cluster_id = MANAGEMENT_PROTOCOL["device_diagnostics"]
+    name = "Device Diagnostics"
+    ep_attribute = "device_diagnostics"
+    manufacturer_id_override = MANAGEMENT_PROTOCOL["manufacturer_code"]
+    AttributeDefs = management_attribute_defs(DEVICE_DIAGNOSTICS_ATTRIBUTES)
+
+
+class MeterCalibrationCluster(CustomCluster):
+    """Meter calibration gains in ppm (1000000 = 1.0) and Reset Energy."""
+
+    cluster_id = 0xFC12
+    name = "Meter Calibration"
+    ep_attribute = "meter_calibration"
+    manufacturer_id_override = MANAGEMENT_PROTOCOL["manufacturer_code"]
 
     class AttributeDefs(foundation.BaseAttributeDefs):
+        voltage_gain_ppm: Final = ZCLAttributeDef(id=0x0000, type=t.uint32_t, access="rw", is_manufacturer_specific=True)
+        current_gain_ppm: Final = ZCLAttributeDef(id=0x0001, type=t.uint32_t, access="rw", is_manufacturer_specific=True)
+        power_gain_ppm: Final = ZCLAttributeDef(id=0x0002, type=t.uint32_t, access="rw", is_manufacturer_specific=True)
 
-        networkIndicator = ZCLAttributeDef(
-            id=0xff01,
-            type=t.Bool,
-            access="rw",  
-            is_manufacturer_specific=False,
+    class ServerCommandDefs(foundation.BaseCommandDefs):
+        reset_energy: Final = ZCLCommandDef(id=0x00, schema={}, is_manufacturer_specific=True)
+
+
+class ButtonState(t.enum8):
+    Released = 0x00
+    Pressed = 0x01
+
+
+# Event types of the ButtonEvent command payload.
+BUTTON_EVENT_ACTIONS = {
+    0x00: "press",
+    0x01: "release",
+    0x02: "hold",
+    0x03: "hold_release",
+}
+BUTTON_EVENT_N_CLICK = 0x04
+# Click counts with a convenience name; larger counts stay generic.
+N_CLICK_ACTIONS = {
+    1: "single",
+    2: "double",
+    3: "triple",
+    4: "quadruple",
+}
+
+
+class CustomButtonEventCluster(CustomCluster):
+    cluster_id = 0xFC02
+    manufacturer_id_override = MANAGEMENT_PROTOCOL["manufacturer_code"]
+
+    class AttributeDefs(foundation.BaseAttributeDefs):
+        button_state = ZCLAttributeDef(
+            id=0x0000,
+            type=ButtonState,
+            access="rp",
+            is_manufacturer_specific=True,
         )
 
-        multi_press_reset_count = ZCLAttributeDef(
-            id=0xff02,
-            type=t.uint8_t,
+        last_event_seq = ZCLAttributeDef(
+            id=0x0001,
+            type=t.uint16_t,
+            access="rp",
+            is_manufacturer_specific=True,
+        )
+
+        multi_click_gap = ZCLAttributeDef(
+            id=0x0002,
+            type=t.uint16_t,
             access="rw",
+            is_manufacturer_specific=True,
+        )
+
+        debounce_ms = ZCLAttributeDef(
+            id=0x0003,
+            type=t.uint16_t,
+            access="rw",
+            is_manufacturer_specific=True,
+        )
+
+        cluster_revision: Final = foundation.ZCL_CLUSTER_REVISION_ATTR
+        reporting_status: Final = foundation.ZCL_REPORTING_STATUS_ATTR
+
+    class ClientCommandDefs(foundation.BaseCommandDefs):
+        button_event: Final = ZCLCommandDef(
+            id=0x00,
+            schema={
+                "seq": t.uint16_t,
+                "press_id": t.uint16_t,
+                "event_type": t.uint8_t,
+                "count": t.uint8_t,
+                "duration_ms": t.uint16_t,
+            },
             is_manufacturer_specific=False,
         )
+
+    def handle_cluster_request(self, hdr, args, *, dst_addressing=None):
+        """Turn a ButtonEvent command into a named ZHA event."""
+        if hdr.command_id != self.ClientCommandDefs.button_event.id:
+            return
+
+        if args.event_type == BUTTON_EVENT_N_CLICK:
+            action = N_CLICK_ACTIONS.get(args.count, "multi_click")
+        else:
+            action = BUTTON_EVENT_ACTIONS.get(args.event_type)
+        if action is None:
+            return
+
+        self.listener_event(
+            ZHA_SEND_EVENT,
+            action,
+            {
+                "seq": args.seq,
+                "press_id": args.press_id,
+                "count": args.count,
+                "duration": args.duration_ms,
+            },
+        )
+
+
+def button_event_triggers(endpoint_id):
+    """Device automation triggers of one button endpoint."""
+    button = "button_" + str(endpoint_id)
+    return {
+        (SHORT_PRESS, button): {
+            COMMAND: "single",
+            CLUSTER_ID: CustomButtonEventCluster.cluster_id,
+            ENDPOINT_ID: endpoint_id,
+        },
+        (DOUBLE_PRESS, button): {
+            COMMAND: "double",
+            CLUSTER_ID: CustomButtonEventCluster.cluster_id,
+            ENDPOINT_ID: endpoint_id,
+        },
+        (TRIPLE_PRESS, button): {
+            COMMAND: "triple",
+            CLUSTER_ID: CustomButtonEventCluster.cluster_id,
+            ENDPOINT_ID: endpoint_id,
+        },
+        (QUADRUPLE_PRESS, button): {
+            COMMAND: "quadruple",
+            CLUSTER_ID: CustomButtonEventCluster.cluster_id,
+            ENDPOINT_ID: endpoint_id,
+        },
+        (LONG_PRESS, button): {
+            COMMAND: "hold",
+            CLUSTER_ID: CustomButtonEventCluster.cluster_id,
+            ENDPOINT_ID: endpoint_id,
+        },
+        (LONG_RELEASE, button): {
+            COMMAND: "hold_release",
+            CLUSTER_ID: CustomButtonEventCluster.cluster_id,
+            ENDPOINT_ID: endpoint_id,
+        },
+        (SHORT_PRESS, button + "_raw"): {
+            COMMAND: "press",
+            CLUSTER_ID: CustomButtonEventCluster.cluster_id,
+            ENDPOINT_ID: endpoint_id,
+        },
+        (SHORT_RELEASE, button + "_raw"): {
+            COMMAND: "release",
+            CLUSTER_ID: CustomButtonEventCluster.cluster_id,
+            ENDPOINT_ID: endpoint_id,
+        },
+    }
 
 
 class RelayIndicatorMode(t.enum8):
@@ -128,9 +310,21 @@ class RelayIndicatorMode(t.enum8):
     Manual = 0x02
 
 
-class OnOffWithIndicatorCluster(CustomCluster, OnOff):
+class RelayOnOffCluster(CustomCluster, OnOff):
 
     class AttributeDefs(OnOff.AttributeDefs):
+        inching_duration: Final = ZCLAttributeDef(
+            id=0xff03,
+            type=t.uint16_t,
+            access="rw",
+            is_manufacturer_specific=False,
+        )
+        interlock_group: Final = ZCLAttributeDef(
+            id=0xff04,
+            type=t.uint8_t,
+            access="rw",
+            is_manufacturer_specific=False,
+        )
         led_mode: Final = ZCLAttributeDef(
             id=0xff01,
             type=RelayIndicatorMode,
@@ -153,6 +347,7 @@ class CoverMoving(t.enum8):
 
 class CustomCoverSwitchCluster(CustomCluster):
     cluster_id = 0xFC01
+    manufacturer_id_override = MANAGEMENT_PROTOCOL["manufacturer_code"]
     
     class AttributeDefs(foundation.BaseAttributeDefs):
         switch_type = ZCLAttributeDef(
@@ -218,6 +413,65 @@ class CustomWindowCoveringCluster(CustomCluster, WindowCovering):
             is_manufacturer_specific=False,
         )
 
+        open_time = ZCLAttributeDef(
+            id=0xff02,
+            type=t.uint32_t,
+            access="rw",
+            is_manufacturer_specific=False,
+        )
+
+        close_time = ZCLAttributeDef(
+            id=0xff03,
+            type=t.uint32_t,
+            access="rw",
+            is_manufacturer_specific=False,
+        )
+
+        closed_deadzone = ZCLAttributeDef(
+            id=0xff04,
+            type=t.uint16_t,
+            access="rw",
+            is_manufacturer_specific=False,
+        )
+
+        open_deadzone = ZCLAttributeDef(
+            id=0xff05,
+            type=t.uint16_t,
+            access="rw",
+            is_manufacturer_specific=False,
+        )
+
+        overrun = ZCLAttributeDef(
+            id=0xff06,
+            type=t.uint16_t,
+            access="rw",
+            is_manufacturer_specific=False,
+        )
+
+    def _update_attribute(self, attrid, value):
+        # The device reports lift 0xFF while the position is unknown (after a
+        # power loss during motion, before the first full move). ZHA would show
+        # 100 - 255, so the cached position is cleared and the cover entity is
+        # told to re-evaluate.
+        lift = WindowCovering.AttributeDefs.current_position_lift_percentage
+        if attrid != lift.id or value is None or value <= 100:
+            super()._update_attribute(attrid, value)
+            return
+        super()._update_attribute(attrid, None)
+        self.emit(
+            AttributeUpdatedEvent.event_type,
+            AttributeUpdatedEvent(
+                device_ieee=str(self.endpoint.device.ieee),
+                endpoint_id=self.endpoint.endpoint_id,
+                cluster_type=self.cluster_type,
+                cluster_id=self.cluster_id,
+                attribute_name=lift.name,
+                attribute_id=lift.id,
+                manufacturer_code=None,
+                value=None,
+            ),
+        )
+
 '''``````````````````````````````````````````````````````````````````
   This file (`zha_quirk.py`) is generated. 
   
@@ -229,13 +483,15 @@ class CustomWindowCoveringCluster(CustomCluster, WindowCovering):
   Generate with: `make tools/update_zha_quirk`
 ``````````````````````````````````````````````````````````````````'''
 
+# (config string, image has the interlock feature and so the InterlockGroup
+# attribute)
 CONFIGS = [
-    {% for config in configs %}
-    "{{ config }}",
+    {% for config, has_interlock in configs %}
+    ("{{ config }}", {{ has_interlock }}),
     {% endfor %}
 ]
 
-for config in CONFIGS:
+for config, has_interlock_groups in CONFIGS:
     zb_manufacturer, zb_model, *peripherals = config.rstrip(";").split(";")
 
     relay_cnt = 0
@@ -244,9 +500,12 @@ for config in CONFIGS:
     cover_switch_cnt = 0
     cover_cnt = 0
     has_dedicated_net_led = False
+    has_meter = False
     for peripheral in peripherals:
-        if peripheral == "SLP":
+        if peripheral == "SLP" or peripheral.startswith("LP"):
             continue
+        if peripheral[0] == 'E':
+            has_meter = True
         if peripheral[0] == "R":
             relay_cnt += 1
         if peripheral[0] == 'S':
@@ -344,23 +603,86 @@ for config in CONFIGS:
                 device_class=SensorDeviceClass.ENUM,
                 attribute_converter = lambda x: {0: "released", 1: "press", 2: "long_press", 3: "position_on", 4: "position_off"}[int(x)]
             )
+            .adds(CustomButtonEventCluster, endpoint_id=endpoint_id)
+            .number(
+                CustomButtonEventCluster.AttributeDefs.multi_click_gap.name,
+                CustomButtonEventCluster.cluster_id,
+                translation_key="multi_click_gap_"+str(endpoint_id),
+                fallback_name="Multi click gap "+str(endpoint_id),
+                min_value=100,
+                max_value=2000,
+                step=10,
+                unit="ms",
+                endpoint_id=endpoint_id,
+                entity_type=EntityType.CONFIG,
+            )
+            .number(
+                CustomButtonEventCluster.AttributeDefs.debounce_ms.name,
+                CustomButtonEventCluster.cluster_id,
+                translation_key="debounce_"+str(endpoint_id),
+                fallback_name="Debounce "+str(endpoint_id),
+                min_value=1,
+                max_value=200,
+                step=1,
+                unit="ms",
+                endpoint_id=endpoint_id,
+                entity_type=EntityType.CONFIG,
+            )
+            .sensor(
+                CustomButtonEventCluster.AttributeDefs.button_state.name,
+                CustomButtonEventCluster.cluster_id,
+                translation_key="button_state_"+str(endpoint_id),
+                fallback_name="Button state "+str(endpoint_id),
+                endpoint_id=endpoint_id,
+                device_class=SensorDeviceClass.ENUM,
+                attribute_converter = lambda x: {0: "released", 1: "pressed"}[int(x)],
+                entity_type=EntityType.DIAGNOSTIC,
+                initially_disabled=True,
+            )
+            .device_automation_triggers(button_event_triggers(endpoint_id))
         )
-    for endpoint_id in range(switch_cnt + 1, switch_cnt + min(relay_cnt, indicators_cnt) + 1):
+    for endpoint_id in range(switch_cnt + 1, switch_cnt + relay_cnt + 1):
         builder = (
             builder
             .removes(OnOff.cluster_id, cluster_type=ClusterType.Client, endpoint_id=endpoint_id)
-            .adds(OnOffWithIndicatorCluster, endpoint_id=endpoint_id)
+            .adds(RelayOnOffCluster, endpoint_id=endpoint_id)
+            .number(
+                RelayOnOffCluster.AttributeDefs.inching_duration.name,
+                RelayOnOffCluster.cluster_id,
+                translation_key="inching_duration_"+str(endpoint_id),
+                fallback_name="Inching duration "+str(endpoint_id),
+                min_value=0,
+                max_value=65535,
+                step=1,
+                unit="ms",
+                endpoint_id=endpoint_id,
+            )
+        )
+        if has_interlock_groups:
+            builder = builder.number(
+                RelayOnOffCluster.AttributeDefs.interlock_group.name,
+                RelayOnOffCluster.cluster_id,
+                translation_key="interlock_group_"+str(endpoint_id),
+                fallback_name="Interlock group "+str(endpoint_id),
+                min_value=0,
+                max_value=10,
+                step=1,
+                endpoint_id=endpoint_id,
+            )
+    for endpoint_id in range(switch_cnt + 1, switch_cnt + min(relay_cnt, indicators_cnt) + 1):
+        builder = (
+            builder
             .enum(
-                OnOffWithIndicatorCluster.AttributeDefs.led_mode.name,
+                RelayOnOffCluster.AttributeDefs.led_mode.name,
                 RelayIndicatorMode,
-                OnOffWithIndicatorCluster.cluster_id,
+                RelayOnOffCluster.cluster_id,
                 translation_key="relay_led_mode_"+str(endpoint_id),
                 fallback_name="Relay Led mode "+str(endpoint_id),
                 endpoint_id=endpoint_id
             )
             .switch(
-                OnOffWithIndicatorCluster.AttributeDefs.led_state.name,
-                OnOffWithIndicatorCluster.cluster_id,
+                RelayOnOffCluster.AttributeDefs.led_state.name,
+                RelayOnOffCluster.cluster_id,
                 translation_key="relay_led_state_"+str(endpoint_id),
                 fallback_name="Relay led state "+str(endpoint_id),
                 endpoint_id=endpoint_id,
@@ -444,6 +766,43 @@ for config in CONFIGS:
                 attribute_converter = lambda x: {0: "released", 1: "open", 2: "close", 3: "stop", 4: "long_open", 5: "long_close"}[int(x)],
                 entity_type=EntityType.DIAGNOSTIC,
             )
+            .adds(CustomButtonEventCluster, endpoint_id=endpoint_id)
+            .number(
+                CustomButtonEventCluster.AttributeDefs.multi_click_gap.name,
+                CustomButtonEventCluster.cluster_id,
+                translation_key="multi_click_gap_"+str(endpoint_id),
+                fallback_name="Multi click gap "+str(endpoint_id),
+                min_value=100,
+                max_value=2000,
+                step=10,
+                unit="ms",
+                endpoint_id=endpoint_id,
+                entity_type=EntityType.CONFIG,
+            )
+            .number(
+                CustomButtonEventCluster.AttributeDefs.debounce_ms.name,
+                CustomButtonEventCluster.cluster_id,
+                translation_key="debounce_"+str(endpoint_id),
+                fallback_name="Debounce "+str(endpoint_id),
+                min_value=1,
+                max_value=200,
+                step=1,
+                unit="ms",
+                endpoint_id=endpoint_id,
+                entity_type=EntityType.CONFIG,
+            )
+            .sensor(
+                CustomButtonEventCluster.AttributeDefs.button_state.name,
+                CustomButtonEventCluster.cluster_id,
+                translation_key="button_state_"+str(endpoint_id),
+                fallback_name="Button state "+str(endpoint_id),
+                endpoint_id=endpoint_id,
+                device_class=SensorDeviceClass.ENUM,
+                attribute_converter = lambda x: {0: "released", 1: "pressed"}[int(x)],
+                entity_type=EntityType.DIAGNOSTIC,
+                initially_disabled=True,
+            )
+            .device_automation_triggers(button_event_triggers(endpoint_id))
         )
 
     for endpoint_id in range(switch_cnt + relay_cnt + cover_switch_cnt + 1, switch_cnt + relay_cnt + cover_switch_cnt + cover_cnt + 1):
@@ -471,35 +830,119 @@ for config in CONFIGS:
                 entity_type=EntityType.CONFIG,
             )
         )
+        # Travel times 0-429496 ms; deadzones in 1/100 %, and the device rejects
+        # a pair that leaves no travel between them.
+        for attribute, label, max_value, multiplier, step, unit in (
+            ("open_time", "Cover open time", 429496, None, 1, "ms"),
+            ("close_time", "Cover close time", 429496, None, 1, "ms"),
+            ("closed_deadzone", "Cover closed deadzone", 99.99, 0.01, 0.01, "%"),
+            ("open_deadzone", "Cover open deadzone", 99.99, 0.01, 0.01, "%"),
+            ("overrun", "Cover overrun", 65535, None, 1, "ms"),
+        ):
+            builder = builder.number(
+                attribute,
+                CustomWindowCoveringCluster.cluster_id,
+                translation_key=f"cover_{attribute}_{endpoint_id}",
+                fallback_name=f"{label} {endpoint_id}",
+                min_value=0,
+                max_value=max_value,
+                step=step,
+                multiplier=multiplier,
+                unit=unit,
+                endpoint_id=endpoint_id,
+                entity_type=EntityType.CONFIG,
+            )
 
     builder = (
         builder
-        .removes(Basic.cluster_id, cluster_type=ClusterType.Client, endpoint_id=1)
-        .adds(CustomBasicCluster, endpoint_id=1)
+        .adds(DeviceConfigCluster, endpoint_id=1)
+        .adds(DeviceDiagnosticsCluster, endpoint_id=1)
         .number(
-            CustomBasicCluster.AttributeDefs.multi_press_reset_count.name,
-            CustomBasicCluster.cluster_id,
+            "multi_press_reset",
+            DeviceConfigCluster.cluster_id,
             translation_key="multi_press_reset_count",
             fallback_name="Multi press reset count",
+            # 0 = off, otherwise 5-10; the device refuses 1-4.
             min_value=0,
-            max_value=255,
+            max_value=10,
             step=1,
             endpoint_id=1,
             entity_type=EntityType.CONFIG,
         )
     )
 
-    if has_dedicated_net_led:
-        builder = (
-            builder
-            .switch(
-                CustomBasicCluster.AttributeDefs.networkIndicator.name,
-                CustomBasicCluster.cluster_id,
-                translation_key="network_indicator",
-                fallback_name="Network indicator",
+    for attribute, enum_class in (("status", DeviceConfigStatus), ("last_error", DeviceConfigLastError)):
+        builder = builder.enum(
+            attribute,
+            enum_class,
+            DeviceConfigCluster.cluster_id,
+            entity_platform=EntityPlatform.SENSOR,
+            entity_type=EntityType.DIAGNOSTIC,
+            translation_key=f"device_config_{attribute}",
+            fallback_name="Device config " + attribute.replace("_", " "),
+            endpoint_id=1,
+        )
+
+    for _, counter_name, _, _ in DEVICE_DIAGNOSTICS_ATTRIBUTES:
+        if counter_name == "capabilities":
+            continue
+        builder = builder.sensor(
+            counter_name,
+            DeviceDiagnosticsCluster.cluster_id,
+            translation_key=counter_name,
+            fallback_name=counter_name.replace("_", " ").capitalize(),
+            endpoint_id=1,
+            entity_type=EntityType.DIAGNOSTIC,
+            initially_disabled=True,
+        )
+
+    if has_meter:
+        # Electrical Measurement and Metering are standard clusters ZHA
+        # exposes from the device descriptor; calibration is fork-private.
+        builder = builder.adds(MeterCalibrationCluster, endpoint_id=1)
+        for attribute, quantity in (("voltage_gain_ppm", "Voltage"), ("current_gain_ppm", "Current"),
+                                    ("power_gain_ppm", "Power")):
+            builder = builder.number(
+                attribute,
+                MeterCalibrationCluster.cluster_id,
+                translation_key=attribute,
+                fallback_name=f"{quantity} calibration",
+                min_value=50,
+                max_value=150,
+                step=0.01,
+                multiplier=0.0001,
+                unit="%",
                 endpoint_id=1,
                 entity_type=EntityType.CONFIG,
             )
+        builder = builder.command_button(
+            MeterCalibrationCluster.ServerCommandDefs.reset_energy.name,
+            MeterCalibrationCluster.cluster_id,
+            translation_key="reset_energy",
+            fallback_name="Reset energy",
+            endpoint_id=1,
+            entity_type=EntityType.CONFIG,
+        )
+
+    if switch_cnt or cover_switch_cnt:
+        builder = builder.switch(
+            "child_lock",
+            DeviceConfigCluster.cluster_id,
+            translation_key="child_lock",
+            fallback_name="Child lock",
+            endpoint_id=1,
+            entity_type=EntityType.CONFIG,
+        )
+
+    if has_dedicated_net_led:
+        builder = builder.enum(
+            "status_led_mode",
+            DeviceConfigStatusLedMode,
+            DeviceConfigCluster.cluster_id,
+            translation_key="status_led_mode",
+            fallback_name="Status LED mode",
+            endpoint_id=1,
+            entity_type=EntityType.CONFIG,
         )
 
     builder.add_to_registry()

@@ -18,6 +18,7 @@ from tests.zcl_consts import (
     ZCL_ATTR_ONOFF_CONFIGURATION_SWITCH_BINDING_MODE,
     ZCL_ATTR_ONOFF_CONFIGURATION_SWITCH_MODE,
     ZCL_ATTR_ONOFF_CONFIGURATION_SWITCH_RELAY_MODE,
+    ZCL_ATTR_WINDOW_COVERING_CURRENT_POSITION_LIFT_PERCENTAGE,
     ZCL_ATTR_WINDOW_COVERING_MOTOR_REVERSAL,
     ZCL_ATTR_WINDOW_COVERING_MOVING,
     ZCL_CLUSTER_COVER_SWITCH_CONFIG,
@@ -28,11 +29,12 @@ from tests.zcl_consts import (
     ZCL_CMD_ONOFF_OFF,
     ZCL_CMD_ONOFF_ON,
     ZCL_CMD_WINDOW_COVERING_DOWN_CLOSE,
+    ZCL_CMD_WINDOW_COVERING_GOTO_LIFT_PERCENTAGE,
     ZCL_CMD_WINDOW_COVERING_STOP,
     ZCL_CMD_WINDOW_COVERING_UP_OPEN,
 )
 
-DEBOUNCE_MS = 50  # Must match DEBOUNCE_DELAY_MS in button.h
+DEBOUNCE_MS = 25
 MINIMUM_SWITCH_TIME_MS = 200
 
 
@@ -48,7 +50,7 @@ def cleanup_nvm():
 
 @pytest.fixture
 def device_config() -> str:
-    return "StubManufacturer;StubDevice;LC0;SA0u;SA1u;SA2u;SA3u;RB0;RB1;RB2;RB3;CC0C1;CC2C3;"
+    return "StubManufacturer;StubDevice;LC0;SA0u;SA1u;SA2u;SA3u;RB0;RB1;RB2;RB3;"
 
 
 @pytest.fixture()
@@ -133,6 +135,7 @@ class ZCLCommandEvent:
     cluster: int
     cmd: int
     data: bytes
+    dst: str = "binding"
 
     @classmethod
     def from_event(cls, evt: Event) -> "ZCLCommandEvent":
@@ -141,6 +144,7 @@ class ZCLCommandEvent:
             cluster=int(evt.payload["cluster"], 16),
             cmd=int(evt.payload["cmd"], 16),
             data=bytes.fromhex(evt.payload["data_hex"]),
+            dst=evt.payload.get("dst", "binding"),
         )
 
 
@@ -162,6 +166,12 @@ class Device:
             self._gpio_state[pin_num] = bool(val)
         return self._gpio_state[pin_num]
 
+    def pin_state(self, pin: str) -> dict[str, int]:
+        """Direction, pull (hal_gpio_pull_t) and level of a stub pin."""
+        res = self.p.exec(f"pin_state {self._parse_pin(pin)}")
+        assert res.ok, f"pin_state failed: {res.payload}"
+        return {k: int(v) for k, v in res.payload.items() if k != "pin"}
+
     def set_gpio(self, pin: str, val: int) -> None:
         res = self.p.exec(f"set_pin {self._parse_pin(pin)} {val}")
         assert res.ok, f"GPIO failed: {res.payload}"
@@ -171,11 +181,11 @@ class Device:
         pin: str,
     ) -> None:
         self.set_gpio(pin, 0)  # Low is pressed
-        self.step_time(DEBOUNCE_MS + 10)
+        self.step_time(DEBOUNCE_MS)
 
     def release_button(self, pin: str) -> None:
         self.set_gpio(pin, 1)  # High is released
-        self.step_time(DEBOUNCE_MS + 10)
+        self.step_time(DEBOUNCE_MS)
 
     def click_button(self, pin: str) -> None:
         self.press_button(pin)
@@ -269,6 +279,70 @@ class Device:
         res = self.p.exec(f"step_time {ms}")
         assert res.ok, f"Step time failed: {res.payload}"
 
+    def time_advance(self, ms: int) -> None:
+        res = self.p.exec(f"time_advance {ms}")
+        assert res.ok, f"Time advance failed: {res.payload}"
+
+    def tasks_poll(self) -> None:
+        res = self.p.exec("tasks_poll")
+        assert res.ok, f"Task poll failed: {res.payload}"
+
+    def pin_edge(self, pin: str, value: int, after_ms: int = 0) -> None:
+        res = self.p.exec(
+            f"pin_edge {self._parse_pin(pin)} {value} {after_ms}"
+        )
+        assert res.ok, f"Pin edge failed: {res.payload}"
+
+    def time_model(self, model: str) -> None:
+        res = self.p.exec(f"time_model {model}")
+        assert res.ok, f"time_model failed: {res.payload}"
+
+    def time_set(self, virtual_ms: int) -> None:
+        res = self.p.exec(f"time_set {virtual_ms}")
+        assert res.ok, f"time_set failed: {res.payload}"
+
+    def pin_burst(self, pin: str, count: int) -> None:
+        res = self.p.exec(f"pin_burst {self._parse_pin(pin)} {count}")
+        assert res.ok, f"pin_burst failed: {res.payload}"
+
+    def pin_late(self, pin: str, value: int, lag_ms: int) -> None:
+        res = self.p.exec(f"pin_late {self._parse_pin(pin)} {value} {lag_ms}")
+        assert res.ok, f"pin_late failed: {res.payload}"
+
+    def task_fail(self, count: int) -> None:
+        res = self.p.exec(f"task_fail {count}")
+        assert res.ok, f"task_fail failed: {res.payload}"
+
+    def input_diag(self) -> dict[str, int]:
+        res = self.p.exec("input_diag")
+        assert res.ok, f"input_diag failed: {res.payload}"
+        return {key: int(value) for key, value in res.payload.items()}
+
+    def millis(self) -> int:
+        return int(self.status()["uptime_ms"])
+
+    def inject_edges(self, pin: str, edges: list[tuple[int, int]]) -> None:
+        previous_at = 0
+        for value, at_ms in edges:
+            assert at_ms >= previous_at
+            self.pin_edge(pin, value, at_ms - previous_at)
+            previous_at = at_ms
+
+    def click_n(self, pin: str, count: int, gap_ms: int = 100) -> None:
+        for click in range(count):
+            self.click_button(pin)
+            if click + 1 < count:
+                self.step_time(gap_ms)
+
+    def hold_button(self, pin: str, duration_ms: int) -> None:
+        self.press_button(pin)
+        self.step_time(duration_ms)
+
+    def counters(self) -> dict[str, int]:
+        res = self.p.exec("diag")
+        assert res.ok, f"Diagnostics failed: {res.payload}"
+        return {key: int(value) for key, value in res.payload.items()}
+
     def set_battery_voltage(self, mv: int) -> None:
         res = self.p.exec(f"set_battery_voltage {mv}")
         assert res.ok, f"set_battery_voltage failed: {res.payload}"
@@ -283,10 +357,11 @@ class Device:
         self._events.append(evt)
 
     def _parse_pin(self, pin: str) -> int:
+        """Stub HAL pin id: Telink's port << 8 | 1 << index encoding."""
         port = pin[0].upper()
         number = int(pin[1:])
-        port_offset = (ord(port) - ord("A")) * 16
-        return port_offset + number
+        assert "A" <= port <= "Z" and 0 <= number <= 7, f"Bad pin: {pin}"
+        return ((ord(port) - ord("A")) << 8) | (1 << number)
 
     # --- Zigbee helpers ---
     def is_joined(self) -> bool:
@@ -328,6 +403,7 @@ class Device:
         ep: int,
         cluster: int,
         cmd: int | None = None,
+        dst: str | None = None,
         timeout: float = 2.0,
         interval: float = 0.05,
     ) -> ZCLCommandEvent:
@@ -340,6 +416,7 @@ class Device:
                     event.ep == ep
                     and event.cluster == cluster
                     and (cmd is None or event.cmd == cmd)
+                    and (dst is None or event.dst == dst)
                 ):
                     return event
             return None
@@ -360,15 +437,20 @@ class Device:
         wait_for(_announce_sent, timeout=timeout, interval=interval)
 
     def zcl_list_cmds(
-        self, endpoint: int | None = None, cluster: int | None = None
+        self,
+        endpoint: int | None = None,
+        cluster: int | None = None,
+        dst: str | None = "binding",
     ) -> list[ZCLCommandEvent]:
         res = []
         for evt in self._events:
             if evt.kind != "zcl_cmd_send":
                 continue
             e = ZCLCommandEvent.from_event(evt)
-            if (endpoint is None or e.ep == endpoint) and (
-                cluster is None or e.cluster == cluster
+            if (
+                (endpoint is None or e.ep == endpoint)
+                and (cluster is None or e.cluster == cluster)
+                and (dst is None or e.dst == dst)
             ):
                 res.append(e)
         return res
@@ -473,6 +555,15 @@ class Device:
             )
         )
 
+    def zcl_cover_get_position(self, endpoint: int) -> int:
+        return int(
+            self.read_zigbee_attr(
+                endpoint,
+                ZCL_CLUSTER_WINDOW_COVERING,
+                ZCL_ATTR_WINDOW_COVERING_CURRENT_POSITION_LIFT_PERCENTAGE,
+            )
+        )
+
     def zcl_cover_motor_reversal_set(self, endpoint: int, motor_reversal: int) -> None:
         self.write_zigbee_attr(
             endpoint,
@@ -494,6 +585,14 @@ class Device:
     def zcl_cover_stop(self, endpoint: int) -> None:
         self.call_zigbee_cmd(
             endpoint, ZCL_CLUSTER_WINDOW_COVERING, ZCL_CMD_WINDOW_COVERING_STOP
+        )
+
+    def zcl_cover_goto(self, endpoint: int, lift_percentage: int) -> None:
+        self.call_zigbee_cmd(
+            endpoint,
+            ZCL_CLUSTER_WINDOW_COVERING,
+            ZCL_CMD_WINDOW_COVERING_GOTO_LIFT_PERCENTAGE,
+            bytes([lift_percentage]),
         )
 
 

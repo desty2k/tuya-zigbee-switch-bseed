@@ -9,7 +9,7 @@
 
 #include "telink_size_t_hack.h"
 
-#include "device_config/config_parser.h"
+#include "device_config/feature_wiring.h"
 
 #include "app.h"
 #include "hal/gpio.h"
@@ -45,6 +45,9 @@ _attribute_ram_code_sec_ int main(void) {
 int real_main(startup_state_e state) {
     uint8_t isRetention = (state == SYSTEM_DEEP_RETENTION) ? 1 : 0;
 
+    if (!isRetention) {
+        telink_system_init();
+    }
     os_init(isRetention);
 
     irq_enable();
@@ -76,6 +79,7 @@ int real_main(startup_state_e state) {
 
     while (1) {
         drv_wd_clear();
+        telink_millis_poll();
         ev_main();
         drv_wd_clear();
         tl_zbTaskProcedure();
@@ -92,6 +96,7 @@ int real_main(startup_state_e state) {
             // as it messes with GPIO output state, and relays cannot be
             // driven via PULL-ups, it may cause issues.
             if (battery.pin != HAL_INVALID_PIN) {
+                telink_millis_prepare_sleep();
                 telink_gpio_to_pull_for_deep_retention();
                 drv_pm_lowPowerEnter();
                 // If we didn't actually enter deep retention, restore GPIO

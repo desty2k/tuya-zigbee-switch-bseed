@@ -5,7 +5,7 @@ from typing import Iterator
 import pytest
 
 from tests.client import StubProc
-from tests.conftest import Device
+from tests.conftest import DEBOUNCE_MS, Device
 from tests.zcl_consts import (
     ZCL_ATTR_ONOFF,
     ZCL_ATTR_ONOFF_INDICATOR_MODE,
@@ -68,3 +68,78 @@ def test_flash_in_detached_mode(indicator_device: Device) -> None:
     assert not indicator_device.get_gpio("A1", refresh=True)
 
     indicator_device.release_button("A0")
+
+
+def _detach_switch(device: Device) -> None:
+    device.write_zigbee_attr(
+        2, ZCL_CLUSTER_ON_OFF, ZCL_ATTR_ONOFF_INDICATOR_MODE,
+        ZCL_ONOFF_INDICATOR_MODE_SAME,
+    )
+    device.zcl_switch_relay_mode_set(1, ZCL_ONOFF_CONFIGURATION_RELAY_MODE_DETACHED)
+
+
+def test_single_click_has_no_delayed_confirmation(indicator_device: Device) -> None:
+    """A normal detached press keeps its immediate pulse without a delayed echo."""
+    _detach_switch(indicator_device)
+
+    indicator_device.click_button("A0")
+    indicator_device.step_time(100)
+    assert not indicator_device.get_gpio("A1", refresh=True)
+
+    indicator_device.step_time(249)
+    assert not indicator_device.get_gpio("A1", refresh=True)
+    indicator_device.step_time(1)
+    assert not indicator_device.get_gpio("A1", refresh=True)
+
+
+@pytest.mark.parametrize("count", [2, 3], ids=["double", "triple"])
+def test_finalized_click_count_has_compact_confirmation(
+    indicator_device: Device, count: int
+) -> None:
+    """Detached double and triple clicks are confirmed only after the click gap."""
+    _detach_switch(indicator_device)
+
+    indicator_device.click_n("A0", count)
+    indicator_device.step_time(100)
+    assert not indicator_device.get_gpio("A1", refresh=True)
+
+    indicator_device.step_time(249)
+    assert not indicator_device.get_gpio("A1", refresh=True)
+    indicator_device.step_time(1)
+    assert indicator_device.get_gpio("A1", refresh=True)
+
+    for pulse in range(count):
+        indicator_device.step_time(60)
+        assert not indicator_device.get_gpio("A1", refresh=True)
+        if pulse + 1 < count:
+            indicator_device.step_time(70)
+            assert indicator_device.get_gpio("A1", refresh=True)
+
+    indicator_device.step_time(70)
+    assert not indicator_device.get_gpio("A1", refresh=True)
+
+
+def test_network_disconnected_blink_has_priority(indicator_device: Device) -> None:
+    """Detached button feedback must not restart the disconnected-network blink."""
+    _detach_switch(indicator_device)
+    indicator_device.set_network(0)
+    assert indicator_device.get_gpio("A1", refresh=True)
+
+    indicator_device.click_n("A0", 2)
+    # The network blink runs 500 ms on / 500 ms off from set_network(0); the
+    # double-click confirmation is due one click gap after the last release.
+    now_ms = 2 * 2 * DEBOUNCE_MS + 100
+    confirm_at = now_ms + 350
+    assert 510 < confirm_at < 990
+    transitions = []
+    lit = indicator_device.get_gpio("A1", refresh=True)
+    while now_ms < 1100:
+        indicator_device.step_time(10)
+        now_ms += 10
+        if indicator_device.get_gpio("A1", refresh=True) != lit:
+            lit = not lit
+            transitions.append((now_ms, lit))
+
+    assert [state for _, state in transitions] == [False, True]
+    assert 500 <= transitions[0][0] <= 520
+    assert transitions[1][0] - transitions[0][0] == 500

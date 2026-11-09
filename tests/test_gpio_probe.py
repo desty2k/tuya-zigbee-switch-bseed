@@ -1,0 +1,472 @@
+"""GPIO probe over the Device Diagnostics cluster, on the probe stub.
+
+`stub_probe` is built with FEATURES="probe relay switch", the feature set of
+the probe board, so a config string written over Zigbee can drive the pins
+already found while the probe covers the rest. Pin electrical behaviour comes
+from the stub model
+(src/stub/hal/gpio_probe.h): floating, externally driven and pulse-train pins.
+"""
+
+import struct
+
+from client import StubProc
+from conftest import Device
+from management_protocol_consts import (
+    DIAGNOSTICS_CAPABILITY_PROBE,
+    GPIO_PROBE_CLASS_ACTIVE,
+    GPIO_PROBE_CLASS_DRIVEN_HIGH,
+    GPIO_PROBE_CLASS_DRIVEN_LOW,
+    GPIO_PROBE_CLASS_FLOATING,
+    GPIO_PROBE_DRIVEN_LOW_PULSE_MAX_MS,
+    GPIO_PROBE_PULL_UP,
+    GPIO_PROBE_PULL_NONE,
+    GPIO_PROBE_PULL_PHASE_MS,
+    GPIO_PROBE_STATE_PULSE,
+    GPIO_PROBE_STATUS_BAD_PIN,
+    GPIO_PROBE_STATUS_DISABLED,
+    GPIO_PROBE_STATUS_NOT_ARMED,
+    GPIO_PROBE_STATUS_NOT_FLOATING,
+    GPIO_PROBE_STATUS_OK,
+    GPIO_PROBE_STATUS_RANGE,
+    GPIO_PROBE_STATUS_VERIFY_FAILED,
+    GPIO_PROBE_WATCH_OVER_RATE,
+    ZCL_ATTR_DEVICE_CONFIG_TEXT,
+    ZCL_ATTR_DIAGNOSTICS_CAPABILITIES,
+    ZCL_ATTR_DIAGNOSTICS_PROBE_CLASSES,
+    ZCL_ATTR_DIAGNOSTICS_PROBE_LEVELS,
+    ZCL_ATTR_DIAGNOSTICS_PROBE_PINS,
+    ZCL_ATTR_DIAGNOSTICS_PROBE_STATE,
+    ZCL_ATTR_DIAGNOSTICS_PROBE_STATUS,
+    ZCL_ATTR_DIAGNOSTICS_PROBE_WATCH,
+    ZCL_CLUSTER_DEVICE_CONFIG,
+    ZCL_CLUSTER_DEVICE_DIAGNOSTICS,
+    ZCL_CMD_DIAGNOSTICS_PROBE_ARM,
+    ZCL_CMD_DIAGNOSTICS_PROBE_PULL_TEST,
+    ZCL_CMD_DIAGNOSTICS_PROBE_PULSE,
+    ZCL_CMD_DIAGNOSTICS_PROBE_SNAPSHOT,
+    ZCL_CMD_DIAGNOSTICS_PROBE_STOP,
+    ZCL_CMD_DIAGNOSTICS_PROBE_WATCH,
+)
+from zcl_consts import ZCL_ATTR_BASIC_MODEL_ID, ZCL_CLUSTER_BASIC
+
+PROBE_CMD = ["./build/stub/stub_probe"]
+# HAL_GPIO_PULL_DOWN: the rest state of every unclaimed pin, at boot and after
+# each probe operation, so no relay driver input floats.
+REST_PULL = 3
+PROBE_CONFIG = "_TZ3210_drzlxjne;TS011F-probe;"
+# Button B4 (active low, pull-up) and relay B5 found on the TS011F outlet.
+OUTLET_CONFIG = PROBE_CONFIG + "SB4u;RB5;IC4;M;"
+TLSR8258_PROBE_PINS = [f"{port}{index}" for port in "ABCD" for index in range(8)
+                       if (port, index) != ("A", 7)]
+
+
+def pin_id(name: str) -> int:
+    return (ord(name[0]) - ord("A")) << 8 | int(name[1:])
+
+
+def pin_name(pin: int) -> str:
+    return f"{chr(ord('A') + (pin >> 8))}{pin & 0xFF}"
+
+
+class Probe:
+    def __init__(self, device: Device) -> None:
+        self.device = device
+        self.p = device.p
+
+    def command(self, cmd: int, payload: bytes = b"") -> str:
+        return self.device.call_zigbee_cmd_raw(
+            1, ZCL_CLUSTER_DEVICE_DIAGNOSTICS, cmd, payload)["result"]
+
+    def attr(self, attr: int) -> str:
+        return self.device.read_zigbee_attr(1, ZCL_CLUSTER_DEVICE_DIAGNOSTICS, attr)
+
+    def octets(self, attr: int) -> bytes:
+        return bytes.fromhex(self.attr(attr))
+
+    def status(self) -> int:
+        return int(self.attr(ZCL_ATTR_DIAGNOSTICS_PROBE_STATUS))
+
+    def pins(self) -> list[str]:
+        raw = self.octets(ZCL_ATTR_DIAGNOSTICS_PROBE_PINS)
+        return [pin_name(pin) for (pin,) in struct.iter_unpack("<H", raw)]
+
+    def classes(self) -> dict[str, int]:
+        return dict(zip(self.pins(), self.octets(ZCL_ATTR_DIAGNOSTICS_PROBE_CLASSES)))
+
+    def levels(self) -> dict[str, int]:
+        bits = int(self.attr(ZCL_ATTR_DIAGNOSTICS_PROBE_LEVELS))
+        return {pin: (bits >> i) & 1 for i, pin in enumerate(self.pins())}
+
+    def watch(self) -> tuple[int, dict[str, tuple[int, int, int, int, int]]]:
+        raw = self.octets(ZCL_ATTR_DIAGNOSTICS_PROBE_WATCH)
+        (elapsed,) = struct.unpack_from("<I", raw)
+        records = {}
+        for pin, edges, min_us, max_us, level, flags in struct.iter_unpack(
+                "<HIIIBB", raw[4:]):
+            records[pin_name(pin)] = (edges, min_us, max_us, level, flags)
+        return elapsed, records
+
+    def model(self, pin: str, *args: str) -> None:
+        assert self.p.exec(f"probe_pin {pin} {' '.join(args)}").ok
+
+    def info(self, pin: str) -> dict[str, int]:
+        res = self.p.exec(f"probe_pin_info {pin}")
+        assert res.ok
+        return {k: int(v) for k, v in res.payload.items() if k != "pin"}
+
+    def step(self, ms: int) -> None:
+        # One main-loop pass per millisecond, as on the device.
+        for _ in range(ms):
+            self.device.step_time(1)
+
+    def pull_test(self, pins: list[str] | None = None) -> str:
+        pins = pins or []
+        payload = bytes([len(pins)]) + b"".join(struct.pack("<H", pin_id(p)) for p in pins)
+        result = self.command(ZCL_CMD_DIAGNOSTICS_PROBE_PULL_TEST, payload)
+        self.step(4 * GPIO_PROBE_PULL_PHASE_MS + 2)
+        return result
+
+    def arm(self, pin: str) -> str:
+        return self.command(ZCL_CMD_DIAGNOSTICS_PROBE_ARM, struct.pack("<H", pin_id(pin)))
+
+    def pulse(self, pin: str, level: int, ms: int) -> str:
+        return self.command(ZCL_CMD_DIAGNOSTICS_PROBE_PULSE,
+                            struct.pack("<HBH", pin_id(pin), level, ms))
+
+
+def probe_session(config: str = PROBE_CONFIG) -> StubProc:
+    return StubProc(cmd=PROBE_CMD, device_config=config)
+
+
+def assert_resting(probe: Probe, pins: list[str]) -> None:
+    for pin in pins:
+        info = probe.info(pin)
+        assert (info["output"], info["pull"], info["contention"]) == (0, REST_PULL, 0), pin
+
+
+def test_probe_board_boots_with_every_pin_resting_on_the_pull_down() -> None:
+    with probe_session() as proc:
+        probe = Probe(Device(proc))
+        assert probe.device.read_zigbee_attr(
+            1, ZCL_CLUSTER_BASIC, ZCL_ATTR_BASIC_MODEL_ID) == "TS011F-probe"
+        caps = int(probe.attr(ZCL_ATTR_DIAGNOSTICS_CAPABILITIES))
+        assert caps & DIAGNOSTICS_CAPABILITY_PROBE
+        assert probe.pins() == TLSR8258_PROBE_PINS
+        probe.step(50)
+        for pin in TLSR8258_PROBE_PINS:
+            info = probe.info(pin)
+            assert (info["drives"], info["output"], info["pull"]) == (0, 0, REST_PULL), pin
+        assert int(probe.attr(ZCL_ATTR_DIAGNOSTICS_PROBE_STATE)) == 0
+
+
+def test_discovery_procedure_finds_meter_button_and_relay_pins() -> None:
+    with probe_session() as proc:
+        probe = Probe(Device(proc))
+        probe.model("C2", "low")              # BL0937 CF, idle without load
+        probe.model("C3", "train", "1000", "500")  # BL0937 CF1, 1 kHz
+        probe.model("D2", "high")             # button with external pull-up
+
+        assert probe.command(ZCL_CMD_DIAGNOSTICS_PROBE_SNAPSHOT) == "PROCESSED"
+        levels = probe.levels()
+        assert levels["D2"] == 1 and levels["C2"] == 0
+
+        assert probe.pull_test() == "PROCESSED"
+        classes = probe.classes()
+        assert classes["A0"] == GPIO_PROBE_CLASS_FLOATING
+        assert classes["C2"] == GPIO_PROBE_CLASS_DRIVEN_LOW
+        assert classes["D2"] == GPIO_PROBE_CLASS_DRIVEN_HIGH
+        assert classes["C3"] == GPIO_PROBE_CLASS_ACTIVE
+        assert_resting(probe, TLSR8258_PROBE_PINS)
+
+        payload = struct.pack("<HB", 2, 2) + struct.pack(
+            "<HBHB", pin_id("C3"), GPIO_PROBE_PULL_NONE, pin_id("D2"), GPIO_PROBE_PULL_UP)
+        assert probe.command(ZCL_CMD_DIAGNOSTICS_PROBE_WATCH, payload) == "PROCESSED"
+        probe.step(300)
+        probe.model("D2", "low")              # the user presses the button
+        probe.step(150)
+        probe.model("D2", "high")
+        probe.step(1560)
+        elapsed, records = probe.watch()
+        assert elapsed == 2000
+        cf1_edges, cf1_min, cf1_max, _, cf1_flags = records["C3"]
+        assert cf1_edges == 2000 and cf1_min == cf1_max == 1000 and cf1_flags == 0
+        assert records["D2"][0] == 1 and records["D2"][3] == 1
+        assert_resting(probe, ["C3", "D2"])
+
+        # Relay candidate: arm, pulse, cutoff.
+        assert probe.arm("A0") == "PROCESSED"
+        assert probe.pulse("A0", 1, 100) == "PROCESSED"
+        assert probe.info("A0")["output"] == 1
+        assert probe.info("A0")["output_level"] == 1
+        assert int(probe.attr(ZCL_ATTR_DIAGNOSTICS_PROBE_STATE)) & GPIO_PROBE_STATE_PULSE
+        probe.step(100)
+        assert_resting(probe, ["A0"])
+
+        # Each pulse needs a fresh arm; driven-high and active pins are never driven.
+        assert probe.pulse("A0", 1, 100) == "ACTION_DENIED"
+        assert probe.status() == GPIO_PROBE_STATUS_NOT_ARMED
+        assert probe.arm("D2") == "ACTION_DENIED"
+        assert probe.status() == GPIO_PROBE_STATUS_NOT_FLOATING
+        assert probe.arm("C3") == "ACTION_DENIED"
+        assert probe.status() == GPIO_PROBE_STATUS_NOT_FLOATING
+        for pin in ("C2", "C3", "D2"):
+            assert probe.info(pin)["drives"] == 0
+
+
+def test_transistor_base_relay_pin_is_pulse_eligible_under_the_10k_pull_up() -> None:
+    # NPN relay driver, 22 kOhm series base resistor, pulls in from 50 uA base
+    # current. The 10 kOhm pull-up lifts the pin above V_IH, so it classifies
+    # floating; a 1 MOhm pull-up would leave it at V_BE, reading low under both
+    # pulls (driven low, pulse refused).
+    with probe_session() as proc:
+        probe = Probe(Device(proc))
+        probe.model("A0", "base", "22000", "50")
+        assert probe.pull_test(["A0"]) == "PROCESSED"
+        assert probe.classes()["A0"] == GPIO_PROBE_CLASS_FLOATING
+        # Each pull-up phase lets the relay pull in; nothing is plugged in.
+        assert probe.info("A0")["relay_pull_ins"] == 2
+        assert probe.info("A0")["relay_on"] == 0
+
+        assert probe.arm("A0") == "PROCESSED"
+        assert probe.pulse("A0", 1, 100) == "PROCESSED"
+        assert probe.info("A0")["relay_on"] == 1
+        probe.step(100)
+        info = probe.info("A0")
+        assert (info["relay_on"], info["output"], info["contention"]) == (0, 0, 0)
+
+
+def test_low_resistance_transistor_base_reads_driven_low_and_takes_a_short_high_pulse() -> None:
+    # A 1 kOhm base resistor clamps the pin near V_BE under any internal
+    # pull-up: driven low. A short level-1 pulse still pulls the relay in.
+    with probe_session() as proc:
+        probe = Probe(Device(proc))
+        probe.model("A0", "base", "1000", "50")
+        assert probe.pull_test(["A0"]) == "PROCESSED"
+        assert probe.classes()["A0"] == GPIO_PROBE_CLASS_DRIVEN_LOW
+        assert probe.arm("A0") == "PROCESSED"
+        assert probe.pulse("A0", 1, GPIO_PROBE_DRIVEN_LOW_PULSE_MAX_MS) == "PROCESSED"
+        assert probe.info("A0")["relay_on"] == 1
+        probe.step(GPIO_PROBE_DRIVEN_LOW_PULSE_MAX_MS)
+        info = probe.info("A0")
+        assert (info["relay_on"], info["output"], info["output_level"], info["pull"]) == (0, 0, 0, REST_PULL)
+
+
+def test_driven_low_pin_pulse_is_limited_to_a_short_high_level() -> None:
+    with probe_session() as proc:
+        probe = Probe(Device(proc))
+        probe.model("C2", "low")              # BL0937 CF, idle without load
+        assert probe.pull_test(["C2"]) == "PROCESSED"
+        assert probe.classes()["C2"] == GPIO_PROBE_CLASS_DRIVEN_LOW
+
+        assert probe.arm("C2") == "PROCESSED"
+        assert probe.pulse("C2", 1, GPIO_PROBE_DRIVEN_LOW_PULSE_MAX_MS + 1) == "INVALID_VALUE"
+        assert probe.status() == GPIO_PROBE_STATUS_RANGE
+        assert probe.arm("C2") == "PROCESSED"
+        assert probe.pulse("C2", 0, 20) == "INVALID_VALUE"
+        assert probe.status() == GPIO_PROBE_STATUS_RANGE
+        assert probe.pulse("C2", 1, 20) == "ACTION_DENIED"
+        assert probe.status() == GPIO_PROBE_STATUS_NOT_ARMED
+        assert probe.info("C2")["drives"] == 0
+
+        assert probe.arm("C2") == "PROCESSED"
+        assert probe.pulse("C2", 1, GPIO_PROBE_DRIVEN_LOW_PULSE_MAX_MS) == "PROCESSED"
+        info = probe.info("C2")
+        assert (info["drives"], info["output"], info["output_level"]) == (1, 1, 1)
+        probe.step(GPIO_PROBE_DRIVEN_LOW_PULSE_MAX_MS)
+        info = probe.info("C2")
+        assert (info["output"], info["output_level"], info["pull"]) == (0, 0, REST_PULL)
+        assert int(probe.attr(ZCL_ATTR_DIAGNOSTICS_PROBE_STATE)) == 0
+
+
+def test_driven_low_pulse_is_refused_when_the_pin_no_longer_reads_driven_low() -> None:
+    with probe_session() as proc:
+        probe = Probe(Device(proc))
+        probe.model("C2", "low")
+        assert probe.pull_test(["C2"]) == "PROCESSED"
+        assert probe.arm("C2") == "PROCESSED"
+        probe.model("C2", "float")
+        assert probe.pulse("C2", 1, 20) == "ACTION_DENIED"
+        assert probe.status() == GPIO_PROBE_STATUS_VERIFY_FAILED
+        assert probe.classes()["C2"] == GPIO_PROBE_CLASS_FLOATING
+        info = probe.info("C2")
+        assert (info["drives"], info["output"], info["pull"]) == (0, 0, REST_PULL)
+
+
+def test_driven_high_and_active_pins_are_never_pulsed() -> None:
+    with probe_session() as proc:
+        probe = Probe(Device(proc))
+        probe.model("D2", "high")
+        probe.model("C3", "train", "1000", "500")
+        assert probe.pull_test(["D2", "C3"]) == "PROCESSED"
+        assert probe.classes()["D2"] == GPIO_PROBE_CLASS_DRIVEN_HIGH
+        assert probe.classes()["C3"] == GPIO_PROBE_CLASS_ACTIVE
+        for pin in ("D2", "C3"):
+            assert probe.arm(pin) == "ACTION_DENIED"
+            assert probe.status() == GPIO_PROBE_STATUS_NOT_FLOATING
+            assert probe.pulse(pin, 1, 20) == "ACTION_DENIED"
+            assert probe.status() == GPIO_PROBE_STATUS_NOT_ARMED
+            assert probe.info(pin)["drives"] == 0
+
+
+def test_released_pin_is_an_input_with_its_output_latch_cleared() -> None:
+    with probe_session() as proc:
+        probe = Probe(Device(proc))
+        assert probe.pull_test(["A0"]) == "PROCESSED"
+        assert probe.arm("A0") == "PROCESSED"
+        assert probe.pulse("A0", 1, 100) == "PROCESSED"
+        probe.step(100)
+        info = probe.info("A0")
+        assert (info["output"], info["output_level"], info["pull"]) == (0, 0, REST_PULL)
+        assert probe.pull_test(["A0"]) == "PROCESSED"
+        assert probe.classes()["A0"] == GPIO_PROBE_CLASS_FLOATING
+
+
+def test_rate_ceiling_flags_a_fast_pin() -> None:
+    with probe_session() as proc:
+        probe = Probe(Device(proc))
+        probe.model("B4", "train", "40", "20")    # 25 kHz
+        payload = struct.pack("<HB", 1, 1) + struct.pack("<HB", pin_id("B4"), 0)
+        assert probe.command(ZCL_CMD_DIAGNOSTICS_PROBE_WATCH, payload) == "PROCESSED"
+        probe.step(20)
+        _, records = probe.watch()
+        assert records["B4"][4] == GPIO_PROBE_WATCH_OVER_RATE
+        assert_resting(probe, ["B4"])
+
+
+def test_stop_command_ends_a_pulse_and_restores_the_pin() -> None:
+    with probe_session() as proc:
+        probe = Probe(Device(proc))
+        probe.pull_test(["B5"])
+        assert probe.arm("B5") == "PROCESSED"
+        assert probe.pulse("B5", 0, 500) == "PROCESSED"
+        assert probe.info("B5")["output"] == 1
+        assert probe.command(ZCL_CMD_DIAGNOSTICS_PROBE_STOP) == "PROCESSED"
+        assert_resting(probe, ["B5"])
+        assert int(probe.attr(ZCL_ATTR_DIAGNOSTICS_PROBE_STATE)) == 0
+
+
+def test_pins_of_configured_features_are_not_probeable() -> None:
+    with probe_session("M;P;BC3u;LC4;") as proc:
+        probe = Probe(Device(proc))
+        pins = probe.pins()
+        assert "C3" not in pins and "C4" not in pins and len(pins) == 29
+        assert probe.arm("C3") == "INVALID_VALUE"
+        assert probe.status() == GPIO_PROBE_STATUS_BAD_PIN
+
+
+def test_config_written_over_zigbee_drives_its_pins_and_probe_keeps_the_rest() -> None:
+    with probe_session() as proc:
+        device = Device(proc)
+        device.write_zigbee_attr(1, ZCL_CLUSTER_DEVICE_CONFIG,
+                                 ZCL_ATTR_DEVICE_CONFIG_TEXT, OUTLET_CONFIG)
+        proc.send("step_time 300")
+        assert proc.wait_for_exit(1.0)
+
+    with StubProc(cmd=PROBE_CMD) as proc:
+        device = Device(proc)
+        probe = Probe(device)
+        assert device.read_zigbee_attr(1, ZCL_CLUSTER_DEVICE_CONFIG,
+                                       ZCL_ATTR_DEVICE_CONFIG_TEXT) == OUTLET_CONFIG
+
+        # Endpoint 1 is the switch, endpoint 2 the relay; the C4 indicator
+        # follows the relay.
+        device.zcl_relay_on(2)
+        assert device.get_gpio("B5", refresh=True)
+        assert device.get_gpio("C4", refresh=True)
+        device.zcl_relay_off(2)
+        assert not device.get_gpio("B5", refresh=True)
+        assert not device.get_gpio("C4", refresh=True)
+        # `M`: the button is momentary, so one press and release toggles once.
+        device.press_button("B4")
+        device.release_button("B4")
+        assert device.zcl_relay_get(2) == "1"
+        assert device.get_gpio("B5", refresh=True)
+        assert device.get_gpio("C4", refresh=True)
+
+        pins = probe.pins()
+        assert "B4" not in pins and "B5" not in pins and "C4" not in pins
+        assert len(pins) == len(TLSR8258_PROBE_PINS) - 3
+        for pin in ("B4", "B5"):
+            assert probe.arm(pin) == "INVALID_VALUE"
+            assert probe.status() == GPIO_PROBE_STATUS_BAD_PIN
+            assert probe.pulse(pin, 1, 10) == "INVALID_VALUE"
+            assert probe.status() == GPIO_PROBE_STATUS_BAD_PIN
+        assert probe.pull_test(["B5"]) == "INVALID_VALUE"
+        assert probe.status() == GPIO_PROBE_STATUS_BAD_PIN
+        payload = struct.pack("<HB", 2, 1) + struct.pack("<HB", pin_id("B4"), GPIO_PROBE_PULL_UP)
+        assert probe.command(ZCL_CMD_DIAGNOSTICS_PROBE_WATCH, payload) == "INVALID_VALUE"
+        assert probe.status() == GPIO_PROBE_STATUS_BAD_PIN
+
+        # A full pull test and a watch leave the configured pins alone.
+        probe.model("C3", "train", "1000", "500")
+        assert probe.pull_test() == "PROCESSED"
+        assert probe.classes()["C3"] == GPIO_PROBE_CLASS_ACTIVE
+        payload = struct.pack("<HB", 2, 1) + struct.pack("<HB", pin_id("C3"), GPIO_PROBE_PULL_NONE)
+        assert probe.command(ZCL_CMD_DIAGNOSTICS_PROBE_WATCH, payload) == "PROCESSED"
+        probe.step(2000)
+        _, records = probe.watch()
+        assert records["C3"][0] == 2000
+        for pin in ("B4", "B5"):
+            info = probe.info(pin)
+            assert (info["output"], info["pull"], info["drives"]) == (0, 0, 0), pin
+        assert device.zcl_relay_get(2) == "1"
+        assert device.get_gpio("B5", refresh=True)
+
+
+def test_motor_relays_of_a_probed_cover_stay_interlocked() -> None:
+    # A cover device is probed with its motor relays as plain relays in one
+    # `K` group, so Zigbee never energises both directions at once.
+    with probe_session(PROBE_CONFIG + "RA0;RA1;K03;") as proc:
+        device = Device(proc)
+        probe = Probe(device)
+        device.zcl_relay_on(1)
+        assert device.get_gpio("A0", refresh=True)
+        device.zcl_relay_on(2)
+        assert not device.get_gpio("A0", refresh=True)
+        assert not device.get_gpio("A1", refresh=True)
+        device.step_time(200)
+        assert device.zcl_relay_get(1) == "0"
+        assert device.zcl_relay_get(2) == "1"
+        assert device.get_gpio("A1", refresh=True)
+        assert "A0" not in probe.pins() and "A1" not in probe.pins()
+        assert probe.arm("A1") == "INVALID_VALUE"
+
+
+def test_recovery_graph_disables_the_probe() -> None:
+    # A cover token needs a feature the probe image lacks.
+    with probe_session("M;P;CC3C4;") as proc:
+        probe = Probe(Device(proc))
+        assert probe.device.read_zigbee_attr(
+            1, ZCL_CLUSTER_BASIC, ZCL_ATTR_BASIC_MODEL_ID) == "recovery"
+        assert probe.command(ZCL_CMD_DIAGNOSTICS_PROBE_SNAPSHOT) == "ACTION_DENIED"
+        assert probe.status() == GPIO_PROBE_STATUS_DISABLED
+        assert probe.pins() == []
+        assert_resting(probe, TLSR8258_PROBE_PINS)
+
+
+def test_malformed_and_unknown_probe_commands_are_rejected() -> None:
+    with probe_session() as proc:
+        probe = Probe(Device(proc))
+        assert probe.command(ZCL_CMD_DIAGNOSTICS_PROBE_ARM, b"\x00") == "MALFORMED_COMMAND"
+        assert probe.command(ZCL_CMD_DIAGNOSTICS_PROBE_PULSE, b"\x00\x00\x01") == \
+            "MALFORMED_COMMAND"
+        assert probe.command(ZCL_CMD_DIAGNOSTICS_PROBE_PULL_TEST, b"\x02\x00\x00") == \
+            "MALFORMED_COMMAND"
+        assert probe.command(ZCL_CMD_DIAGNOSTICS_PROBE_WATCH, b"\x01\x00\x01") == \
+            "MALFORMED_COMMAND"
+        assert probe.command(ZCL_CMD_DIAGNOSTICS_PROBE_STOP, b"\x00") == "MALFORMED_COMMAND"
+        assert probe.command(0x40) == "SKIPPED"
+        assert probe.status() == GPIO_PROBE_STATUS_OK
+
+
+def test_regular_images_have_no_probe() -> None:
+    with StubProc(device_config="A;B;") as proc:
+        device = Device(proc)
+        assert device.read_zigbee_attr(
+            1, ZCL_CLUSTER_DEVICE_DIAGNOSTICS, ZCL_ATTR_DIAGNOSTICS_CAPABILITIES) == "1"
+        res = proc.exec(f"zcl_read 1 0x{ZCL_CLUSTER_DEVICE_DIAGNOSTICS:04X} "
+                        f"0x{ZCL_ATTR_DIAGNOSTICS_PROBE_STATUS:04X}")
+        assert not res.ok
+        assert device.call_zigbee_cmd_raw(
+            1, ZCL_CLUSTER_DEVICE_DIAGNOSTICS, ZCL_CMD_DIAGNOSTICS_PROBE_ARM,
+            b"\x00\x00")["result"] == "SKIPPED"

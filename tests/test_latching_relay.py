@@ -218,3 +218,52 @@ def test_off_pin_is_a0() -> None:
 
     finally:
         p.stop()
+
+
+def test_coil_pulse_is_retried_when_its_timer_cannot_be_armed(
+    latching_device: Device, pins_config: list[LatchingRelayTestConfig]
+) -> None:
+    cfg = pins_config[0]
+    latching_device.task_fail(1)
+    latching_device.call_zigbee_cmd(cfg.ep, ZCL_CLUSTER_ON_OFF, 0x01)
+    duration = 0
+    seen_high = False
+    for _ in range(400):
+        latching_device.step_time(1)
+        if latching_device.get_gpio(cfg.on_pin, refresh=True):
+            seen_high = True
+            duration += 1
+        elif seen_high:
+            break
+    assert seen_high
+    assert latching_device.get_gpio(cfg.on_pin, refresh=True) is False
+    assert 50 <= duration <= 200
+
+
+def pulse_length(device: Device, pin: str, ep: int, command: int) -> int:
+    device.call_zigbee_cmd(ep, ZCL_CLUSTER_ON_OFF, command)
+    wait_for(lambda: device.get_gpio(pin) is True)
+    duration = 0
+    while device.get_gpio(pin) is True:
+        duration += 1
+        device.step_time(1)
+    return duration
+
+
+@pytest.mark.parametrize("pulse_ms", [10, 50, 500])
+def test_lp_token_sets_pulse_length(pulse_ms: int) -> None:
+    p = StubProc(device_config=f"X;Y;LP{pulse_ms};RB0C0;").start()
+    try:
+        device = Device(p)
+        device.freeze_time()
+        on = pulse_length(device, "B0", 1, 0x01)
+        off = pulse_length(device, "C0", 1, 0x00)
+    finally:
+        p.stop()
+    assert pulse_ms <= on <= pulse_ms + 2
+    assert pulse_ms <= off <= pulse_ms + 2
+
+
+def test_pulse_defaults_to_100_ms_without_lp_token(latching_device: Device) -> None:
+    latching_device.freeze_time()
+    assert 100 <= pulse_length(latching_device, "B0", 1, 0x01) <= 102

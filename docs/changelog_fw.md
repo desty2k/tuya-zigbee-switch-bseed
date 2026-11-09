@@ -6,9 +6,76 @@ _Open the **Outline** (table of contents) from the top right._
 
 Please describe what you are working on, under ## Upcoming
 
+## v2.0.0-rc.6
+
+- The repository is `desty2k/tuya-zigbee-switch-bseed`; links in docs, OTA indexes and integration descriptions name it. Links to `desty2k/tuya-zigbee-switch` keep working through GitHub's redirect.
 ------------------------------------------------------->
 
 ## Upcoming
+
+- Zigbee2MQTT 2.x: a device interviewed or paired while Zigbee2MQTT runs (including one just converted from stock firmware) gets the fork's custom clusters at once, and covers configure; their configure failed with `Invalid attribute 'moving' for cluster 'closuresWindowCovering'` and their settings could not be read until Zigbee2MQTT restarted.
+- Multi-press reset count (`multi_press_reset_count`, Device Config `0x0011`) accepts 0 (off) or 5–10 and refuses other values without changing the setting or Status; Zigbee2MQTT, ZHA and HOMEd offer 0–10, and Zigbee2MQTT rejects 1–4 before writing. 1–4 turned single, double or triple clicks into a factory reset. A stored count outside 0 or 5–10 reads as 10 after a restart.
+- A config string whose `G` token lies outside 100–2000 ms, the range of the multi-click gap setting, is refused as malformed (`parse`); any value up to 65535 was accepted.
+- Switch, relay and cover-switch settings refuse values outside their documented range with `INVALID_VALUE` and keep their value: switch type, action, relay and binded mode, long press duration (0–5000 ms), level move rate (1–255), power-on behaviour (`off`, `on`, `toggle`, `previous`), indicator mode and state, and every cover-switch setting (cover index up to the device's covers). Out-of-range values were stored and left the setting without effect.
+- A refused config-string write sets `device_config_status` to `error` and `device_config_last_error` to the reason (`parse`, `resource` or `feature_missing`), as documented; both stayed unchanged. Nothing is stored, and a Write Attributes Undivided frame with a refused string changes no attribute.
+- A stored config string with more than 8 endpoints, or a meter on counter inputs the platform lacks, boots the recovery graph with `device_config_last_error` `resource`, the same reason a write of that string reports; it reported `parse` at boot.
+- HOMEd offers the `deferred_single` relay mode, and names the endpoints of boards with 4 or more switches, relays or covers like Zigbee2MQTT does, counting from 0 (`switch_0`, `relay_0`, `cover_0`); it counted them from 1.
+- The Zigbee2MQTT `device_config` check accepts exactly what the firmware parser accepts: the `G` token (100–2000 ms), `D` of 1–200 ms, buttons without a pull suffix, a missing `;` after the last token, at most 127 characters, and the pin range of the board's chip (`A0`–`D7` on Telink, `A0`–`D15` on Silabs). It refuses tokens the parser rejects, such as `D0`, a malformed `M`, `i` or LED suffix, or a relay with a third pin.
+- The Zigbee2MQTT level move rate setting is described in level units per second; it said steps per ms.
+- Status LED mode `on` keeps the dedicated status LED lit while the device is not joined too; it blinked like `network`. `network` and `off` still blink while not joined.
+- A device that is not joined retries network steering after 1, 2, 4, 8, 16 and then every 30 s, each wait jittered by ±25 %, instead of restarting it on every main-loop pass; a join, a leave or a factory reset starts again with an immediate attempt. Device Diagnostics `Steering` counts the attempts started.
+- After network steering ends in a join, the status LED (or the relay indicators of a board without one) blinks 7 times (500 ms on, 500 ms off) in every status LED mode, then shows the mode's state. A boot already joined or a rejoin without steering does not blink.
+- A `K` interlock mask longer than 4 hex digits is refused as malformed (`parse`); it was cut to its low 16 bits.
+- Zigbee2MQTT offers a cover switch's `cover_index` only for the covers the device has; a device without covers offered `cover_1` and `cover_2`.
+- Telink: a Zigbee stack fault (for example a MAC transmit timeout or exhausted packet buffers) resets the device, as in Telink's own sample applications. The stack kept running in the faulted state: the device stopped sending and routing, so its neighbours that routed through it went offline too, until a power cycle. Device Diagnostics `LastResetFault` (`0x0060`) reports the fault that caused the last reset.
+- **Latching pulse length**: the config string token `LP<ms>` (10–500 ms) sets the pulse of every latching relay; without it the pulse stays 100 ms. Zigbee2MQTT's `device_config` check accepts it.
+- The `-from_tuya` and `-forced` OTA images carry file version `0xFFFFFFFE`. Zigbee2MQTT 2.14 sent their `0xFFFFFFFF` as an empty version in the image blocks, and the device aborted the download.
+
+## v2.0.0-rc.5
+
+- Images for every built board are published in this repository, and the Zigbee2MQTT OTA indexes list only them; generated index URLs and integration descriptions name the fork.
+- Telink builds compile without warnings.
+- Images without the interlock feature (single-relay boards without a cover) have no relay `InterlockGroup` (`0xFF04`) attribute, and Zigbee2MQTT, ZHA and HOMEd offer the interlock group only on boards whose image has it. The attribute accepted only 0 there: a single relay has nothing to interlock with.
+- **Child lock**: a press that starts while the device is locked sends no Button Event (`0xFC02`) commands and leaves `ButtonState` released, so automations on button actions are locked too. Locked detached switches sent their press, click and hold events to the coordinator.
+- Config strings with the `U` pull suffix (weak 1 MΩ pull-up; Silabs uses its only pull-up) are accepted again; they booted the recovery graph (`OUTLET_TUYA_PM_TS011F`, `SWITCH_IHSENO_TS0001`, `SWITCH_IHSENO_TS0002`).
+- A battery pin (`BT`) may share a button pin, as the battery remotes measure VBAT through one; their config strings booted the recovery graph.
+- `SWITCH_MILFRA_TS0001` has no onboard reset button: it shared the switch input pin, which the parser rejects. The multi-press reset remains.
+- `make unit_tests` parses every built board's config string with the firmware parser.
+- Zigbee2MQTT, ZHA and HOMEd expose each relay's inching duration (`<relay>_inching_duration`, ms, 0 = off) and interlock group (`<relay>_interlock_group`, 0 = none).
+
+## v2.0.0-rc.3
+
+- Telink: a cluster-specific command to a cluster without commands (power configuration, multistate input, on/off switch configuration, the fork-private clusters) is answered with an unsupported-command status; it reset the device.
+- A switch whose relay index points at a relay endpoint drives that endpoint's relay when a cover is defined before the relays in the device config; it drove the cover's open relay.
+- Telink: attribute reports from the fork-private clusters carry the fork's manufacturer code, as on Silabs.
+- Telink: the `i<image_type>` config token sets the OTA image type again; it was parsed and ignored.
+- Device Diagnostics (`0xFC11`) values refresh once per second instead of on every main-loop pass, and uptime is no longer reportable.
+- Telink release images leave out the debug `printf` calls, which only produce output with `DEBUG=1`.
+- Single-relay boards without a cover leave out relay interlock: the `K` config token needs the `interlock` feature, added automatically to boards with a cover or more than one relay.
+- **Child lock**: Device Config `ChildLock` (`0x0012`) makes the device ignore its local switch and cover-switch buttons (relays, covers and bound commands) while Zigbee control keeps working; it survives reboots and OTA, and a factory reset releases it. Toggled on the device by holding a cover's stop button for 5 s (or open+close without one) or the first two switch buttons for 3 s, or a single switch button for 10 s, when those inputs are momentary. The new `P<pin>[i]` config token names the lock LED (3 blinks on lock, 2 on unlock, 1 per press while locked); without it the status LED or first indicator blinks, layered over its state. The BSEED TS130F (vsj5o7dm) uses its red LED `D2`. Zigbee2MQTT exposes `child_lock` (LOCK/UNLOCK), ZHA and HOMEd a switch; they read it rather than configure a report, and the device sends the coordinator one report when the lock is toggled on the device.
+- A cover resting at an end ignores open or close commands towards that end when the end was reached by a completed move, or after a stop there without an overrun; the relay used to switch on and off at once.
+- HOMEd: relay indicator settings appear only on relay endpoints; a cover's indicators no longer add them to other endpoints.
+- The relay indicator LED and its state attribute always agree: in `same`/`opposite` mode a written indicator state is replaced by the relay-derived one and reported, and switching the indicator mode to `manual` shows the stored state on the LED. A write in another mode left the attribute at the written value while the LED followed the relay.
+- A device whose stored config the image rejects (for example a cover config under an image without the cover feature: `LastError` `FEATURE_MISSING`) holds every general-purpose pin on the pull-down in its recovery graph. The pins were left floating, so relay driver inputs picked up mains hum: the BSEED TS130F shutter hummed and chattered both motor relays.
+- Power monitoring for BL0937 outlets: the `EB<CF><CF1><SEL>[i]` config token adds voltage, current and active power (Electrical Measurement `0x0B04`) and energy (Metering `0x0702`) on endpoint 1, plus calibration gains and a Reset Energy command on the fork-private Meter Calibration cluster (`0xFC12`). Energy and calibration survive reboots and OTA. New board `OUTLET_BSEED_TS011F_PM_DRZLXJNE` (TS011F `_TZ3210_drzlxjne`); its default calibration is not yet checked against a reference meter.
+- **Cover stop button**: `X<open><close><stop><pull>` adds a stop button to a cover switch; a cover lights the next two `I` LEDs while opening and while closing. `COVER_BSEED_TS130F_VSJ5O7DM` supports the BSEED shutter switch `_TZ3000_vsj5o7dm` (up, stop and down buttons, direction LEDs, backlight as the status LED).
+- The GPIO probe image holds every unclaimed pin on the 100 kΩ pull-down from boot and after each probe operation; a floating relay driver input made a TS130F hum and chatter. `COVER_BSEED_TS130F_PROBE` probes the BSEED shutter switch `_TZ3000_vsj5o7dm`.
+- A GPIO probe image may carry the relay and switch features: a config string written over Zigbee drives the pins it claims while the probe covers the rest. `OUTLET_BSEED_TS011F_PROBE` ships with button `B4` (momentary), relay `B5` and relay indicator `C4` (`SB4u;RB5;IC4;M;`), and its Zigbee2MQTT definition exposes the relay, the indicator modes and the button next to the probe.
+- Zigbee2MQTT configures a cover's position report, so moves started from the device buttons update the position.
+
+## v2.0.0-rc.2
+
+- Fixes rc.1 resetting on relay changes, button actions, rejoins and most incoming ZCL commands other than Read Attributes: the Telink compiler miscompiled switch statements at `-Os`; all Telink objects now build without jump tables and the link fails if a malformed table dispatch appears.
+
+## v2.0.0-rc.1
+
+**Do not install.** Resets on relay changes and most incoming ZCL commands (fixed in rc.2).
+
+First release of the BSEED-focused fork as its own product line. It does not
+keep the settings of upstream or 1.x firmware: updating from them resets the
+device's settings, while network membership, binds and groups survive.
+Settings survive updates between 2.x releases. OTA file versions follow
+`docs/contribute/release.md`, so every 2.x build is newer than any 1.x build.
 
 ### Devices
 
@@ -18,10 +85,18 @@ Please describe what you are working on, under ## Upcoming
 
 ### Features
 
+- **GPIO probe image** (`features: [probe]`): discovers the pins of a device that cannot be opened, over Zigbee (cluster `0xFC11`); first board `OUTLET_BSEED_TS011F_PROBE` for TS011F `_TZ3210_drzlxjne`
+- OTA index generator refuses entries with a stock image type and no `manufacturerName` filter
+- **Button Event cluster** (`0xFC02`) sends press, release, hold, hold-release, and multi-click actions to the coordinator. Generated Zigbee2MQTT and ZHA integrations expose these actions, per-endpoint multi-click and debounce settings, and input diagnostics.
 - **Cover cluster** (window covering) for controlling the motor of curtains, blinds, and shutters.
   Supports open, close, and stop commands with motor safety delays.
+  - With open/close travel times set, the cover tracks its position and accepts *GoToLiftPercentage*.
+    `CurrentPositionLiftPercentage` follows ZCL: 0 = fully open, 100 = fully closed, 0xFF = position unknown.
+  - After a power loss during motion, or before the first full move, the position is unknown: *GoToLiftPercentage* to an intermediate position is refused and OPEN/CLOSE run the full travel time plus overrun. Reaching an endpoint makes the position known again.
+  - The motor stops if its cutoff timer cannot be armed, and the command fails with `ACTION_DENIED`.
 - **Cover switch cluster** for handling user input from window covering switches.
   Supports toggle/momentary switches, stop-on-repeat, stop button, local control, and remote device binding.
+  The long-press duration is saved and survives reboots and updates.
 - Relays now respond to *MoveToLevelWithOnOff*
   - Level = 0 -> Turn off relay
   - Level > 0 -> Turn on  relay
@@ -35,7 +110,17 @@ Please describe what you are working on, under ## Upcoming
 
 ### Changes
 
+- **Settings reset when updating from upstream or pre-release fork firmware.**
+  The first boot after the OTA update clears switch and relay settings (switch mode, detached mode, long press, startup mode, indicator modes, inching), cover calibration and position, a custom config string, the network LED setting and the multi-press reset count.
+  The device then runs with its board's default config, like a fresh flash. Network membership, binds and groups are kept.
 - Add `D<N>` config option to customize button debounce delay in milliseconds
+- **Generated integrations** (Zigbee2MQTT, ZHA, HOMEd) configure the device through the Device Config (`0xFC10`) and Device Diagnostics (`0xFC11`) clusters, and send the fork manufacturer code `0x1A2B` on every fork-private cluster (`0xFC01`, `0xFC02`, `0xFC10`, `0xFC11`). The network LED switch became the status LED mode (`network`, `off`, `on`); diagnostic counters carry the cluster's attribute names.
+- Covers in Zigbee2MQTT show 100 = open (the device reports ZCL lift %, 0 = open); an unknown position shows as no value in ZHA, while Zigbee2MQTT keeps the last position. Open and close times, deadzones and overrun are exposed in all three integrations, and the cover-switch long press in HOMEd.
+- The GPIO probe board has a Zigbee2MQTT converter (model `TS011F-probe`) for `helper_scripts/probe_discovery.py`.
+- **Relay inching** (`InchingDuration`) pulses the relay for every switch-on: Zigbee On, Toggle, *MoveToLevelWithOnOff*, bindings, local switches and startup ON.
+- **Relay interlock** (`K<mask>[:<ms>]` config option) is defined by the config string only; Zigbee can add an ungrouped relay to a `K` group but cannot change config-defined groups. A relay that joins a group while another member is on switches off. `K` without `:<ms>` waits 200 ms between one relay switching off and the next switching on.
+- Relay settings (startup mode, indicator modes, inching, interlock) reset when the config string changes the relay behind an endpoint or the relays of an interlock group; relay pins, dead times and cover relay pairs do not reset them.
+- *OnWithTimedOff* honours "accept only when on", never shortens a running timed-off and treats an on time of 0xFFFF as "stay on". On a relay with inching the inching duration caps the on time.
 - **Bi-stable (latching) relays** have been reworked
   - They now use proper pulses instead of continuously driving the coil
   - Pressing multiple buttons will toggle the relays with small delays in-between (safe)

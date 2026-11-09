@@ -4,6 +4,10 @@ from pathlib import Path
 import yaml
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from board_features import board_features, build_features
+
+FEATURE_ORDER = build_features()
+
 env = Environment(
     loader=FileSystemLoader("helper_scripts/templates"),
     autoescape=select_autoescape(),
@@ -31,8 +35,11 @@ if __name__ == "__main__":
     devices = []
 
     for device in db.values():
+        # A GPIO probe board is built on demand (`build: no`) but still needs its
+        # converter: the discovery helper drives it through Zigbee2MQTT.
+        is_probe = "probe" in (device.get("features") or [])
         # Skip if build == no. Defaults to yes
-        if not device.get("build", True):
+        if not is_probe and not device.get("build", True):
             continue
 
         config = device["config_str"]
@@ -45,8 +52,9 @@ if __name__ == "__main__":
         indicators_cnt = 0
         has_dedicated_net_led = False
         has_battery_cluster = False
+        has_meter = False
         for peripheral in peripherals:
-            if peripheral == "SLP" or peripheral == "M":
+            if peripheral in ("SLP", "M") or peripheral.startswith("LP"):
                 continue
             if peripheral[0] == "R":
                 relay_cnt += 1
@@ -62,6 +70,11 @@ if __name__ == "__main__":
                 has_dedicated_net_led = True
             if peripheral[:2] == "BT":
                 has_battery_cluster = True
+            if peripheral[0] == "E":
+                has_meter = True
+
+        # The InterlockGroup attribute exists only in images with the interlock feature.
+        has_interlock_groups = "interlock" in board_features(device, FEATURE_ORDER)
 
         if switch_cnt == 1:
             switch_names = ["switch"]
@@ -108,15 +121,21 @@ if __name__ == "__main__":
         devices.append(
             {
                 "zb_models": [zb_model] + (device.get("old_zb_models") or []),
-                "model": device.get("override_z2m_device")
-                or device["stock_converter_model"],
+                # A probe image is its own Zigbee2MQTT model, never the stock one.
+                "model": zb_model if is_probe else (
+                    device.get("override_z2m_device") or device["stock_converter_model"]),
+                "probe": is_probe,
                 "switchNames": switch_names,
                 "relayNames": relay_names,
                 "relayIndicatorNames": relay_names[:indicators_cnt],
+                "relayInterlockNames": relay_names if has_interlock_groups else [],
                 "coverSwitchNames": cover_switch_names,
                 "coverNames": cover_names,
                 "has_dedicated_net_led": has_dedicated_net_led,
                 "has_battery_cluster": has_battery_cluster,
+                "has_meter": has_meter,
+                # Highest pin index the firmware accepts: Telink ports have 8 pins.
+                "maxPinIndex": 15 if device.get("mcu_family") == "Silabs" else 7,
             }
         )
 

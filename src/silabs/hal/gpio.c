@@ -2,18 +2,20 @@
 #include <stddef.h>
 #include <string.h>
 
+#ifdef SL_COMPONENT_CATALOG_PRESENT
+#include "sl_component_catalog.h"
+#endif
 #include "sl_clock_manager.h"
 #include "sl_gpio.h"
-
-#include "zigbee_app_framework_event.h"
+#if defined(SL_CATALOG_POWER_MANAGER_PRESENT)
+#include "sl_power_manager.h"
+#endif
 
 #include "hal/gpio.h"
+#include "hal/timer.h"
+#include "silabs/hal/silabs_gpio_pin.h"
 #include "silabs/hal/silabs_gpio_utils.h"
 #include <stdio.h>
-
-// Get container structure from embedded member pointer
-#define container_of(ptr, type, member) \
-        ((type *)((char *)(ptr) - offsetof(type, member)))
 
 #define LINE_MISSING     0xFF
 #define MAX_INT_LINES    16
@@ -38,15 +40,19 @@ static void hal_gpio_ensure_gpio_init(void) {
 
 // ------ Per-interrupt bookkeeping ------
 typedef struct {
-    bool               in_use;
-    hal_gpio_pin_t     hal_pin;
-    gpio_callback_t    user_cb;
-    int32_t            line;
-    void *             arg;
-    sli_zigbee_event_t af_event;
+    bool           in_use;
+    hal_gpio_pin_t hal_pin;
+    uint8_t        last_level;
+    int32_t        line;
 } int_slot_t;
 
-static int_slot_t s_slots[MAX_INT_LINES]; // 16 EXTI lines total
+static int_slot_t             s_slots[MAX_INT_LINES]; // 16 EXTI lines total
+static hal_gpio_edge_sink_t   edge_sink;
+static hal_gpio_diagnostics_t diagnostics;
+
+/* Set by the EXTI handler after delivering an edge, cleared by the main loop
+ * that consumes it. */
+static volatile bool edge_pending;
 
 static int32_t alloc_int_slot(void) {
     for (uint8_t i = 0; i < 16; i++) {
@@ -59,27 +65,27 @@ static int32_t alloc_int_slot(void) {
     return LINE_MISSING;
 }
 
-static void free_int_slot(int32_t slot_no) {
-    if (slot_no < MAX_INT_LINES) {
-        memset(&s_slots[slot_no], 0, sizeof(s_slots[slot_no]));
-    }
-}
-
-// Dispatchers, e.g. IRQ routinues
 static void _dispatch_regular(uint8_t intNo, void *ctx) {
     (void)intNo;
     int_slot_t *slot = (int_slot_t *)ctx;
-    if (slot) {
-        sl_zigbee_af_event_set_active(&slot->af_event);
-    }
-}
 
-static void _af_event_handler(sl_zigbee_af_event_t *event) {
-    // Get int_slot_t from embedded af_event field
-    int_slot_t *slot = container_of(event, int_slot_t, af_event);
+    diagnostics.gpio_irq_count++;
+    if (slot != NULL) {
+        uint8_t level = hal_gpio_read(slot->hal_pin);
+        if (level != slot->last_level) {
+            hal_gpio_edge_t edge = {
+                .pin          = slot->hal_pin,
+                .level        = level,
+                .timestamp_ms = hal_millis(),
+            };
 
-    if (slot->user_cb) {
-        slot->user_cb(slot->hal_pin, slot->arg);
+            slot->last_level = level;
+            diagnostics.gpio_edges_captured++;
+            if (edge_sink != NULL) {
+                edge_sink(&edge);
+            }
+            edge_pending = true;
+        }
     }
 }
 
@@ -93,6 +99,8 @@ void hal_gpio_init(hal_gpio_pin_t gpio_pin, uint8_t is_input,
     if (is_input) {
         switch (pull_direction) {
         case HAL_GPIO_PULL_UP:
+        case HAL_GPIO_PULL_UP_1M:
+            // EFR32 has one pull-up strength.
             sl_gpio_set_pin_mode(&sl_gpio, SL_GPIO_MODE_INPUT_PULL,
                                  1); // DOUT=1 => pull-up
             break;
@@ -108,10 +116,46 @@ void hal_gpio_init(hal_gpio_pin_t gpio_pin, uint8_t is_input,
         // Output: push-pull, initial low
         sl_gpio_set_pin_mode(&sl_gpio, SL_GPIO_MODE_PUSH_PULL, 0);
     }
+}
 
-    // Optional: store pull direction for interrupt polarity later.
-    // We don’t keep a global pin map; polarity is picked at registration time
-    // by looking up the slot when the user calls hal_gpio_int_callback.
+/*
+ * EFR32MG21/MG22 general-purpose pins: every pin of ports A-D the part
+ * bonds out. Left out: PA1/PA2 (SWCLK/SWDIO, the debug and recovery
+ * interface), PA5/PA6 while the debug USART owns them, PD0/PD1 while the
+ * LFXO runs on them. The HFXO has dedicated pads. PA3/PA4 (SWV and JTAG TDI)
+ * stay in: SWD does not use them and boards wire switches and relays to them.
+ */
+static bool rest_reserved(GPIO_Port_TypeDef port, uint8_t pin) {
+    if (port == gpioPortA && (pin == 1 || pin == 2)) {
+        return true;
+    }
+#if defined(SL_CATALOG_IOSTREAM_USART_PRESENT)
+    if (port == gpioPortA && (pin == 5 || pin == 6)) {
+        return true;
+    }
+#endif
+#if defined(SL_CATALOG_DEVICE_INIT_LFXO_PRESENT)
+    if (port == gpioPortD && (pin == 0 || pin == 1)) {
+        return true;
+    }
+#endif
+    return false;
+}
+
+void hal_gpio_rest_all(void) {
+    hal_gpio_ensure_clock();
+    for (uint8_t port = gpioPortA; port <= gpioPortD; port++) {
+        for (uint8_t pin = 0; pin < 16; pin++) {
+            sl_gpio_t sl_gpio = { .port = port, .pin = pin };
+
+            if (!GPIO_PORT_PIN_VALID(port, pin) ||
+                rest_reserved((GPIO_Port_TypeDef)port, pin) ||
+                GPIO_PinModeGet((GPIO_Port_TypeDef)port, pin) > gpioModeInputPullFilter) {
+                continue;
+            }
+            sl_gpio_set_pin_mode(&sl_gpio, SL_GPIO_MODE_INPUT_PULL, 0);
+        }
+    }
 }
 
 void hal_gpio_set(hal_gpio_pin_t gpio_pin) {
@@ -134,72 +178,72 @@ uint8_t hal_gpio_read(hal_gpio_pin_t gpio_pin) {
     return value;
 }
 
-// Register an interrupt that also attempts EM4 wake-up.
-// - Wakes from EM2/EM3 via normal EXTI (edge-sensitive).
-// - Wakes from EM4 if the pin supports EM4WU (level-sensitive).
-//   Polarity rule:
-//     * If input has pull-up  -> active-low (wake on low level).
-//     * If input has pull-down-> active-high (wake on high level).
-//     * Otherwise default to rising+falling EXTI and active-low EM4WU.
-void hal_gpio_callback(hal_gpio_pin_t gpio_pin, gpio_callback_t callback,
-                       void *arg) {
+void hal_gpio_set_edge_sink(hal_gpio_edge_sink_t sink) {
+    edge_sink = sink;
+}
+
+void hal_gpio_process_pending(void) {
+    edge_pending = false;
+}
+
+#if defined(SL_CATALOG_POWER_MANAGER_PRESENT)
+
+/*
+ * Edge sinks only queue work for the main loop. Without these hooks the power
+ * manager may go back to sleep after the EXTI interrupt (when the wake-up
+ * also restored the HF clock) or enter sleep between the main loop pass and
+ * the sleep call, leaving the press unhandled until the next stack event.
+ */
+bool app_is_ok_to_sleep(void) {
+    return !edge_pending;
+}
+
+sl_power_manager_on_isr_exit_t app_sleep_on_isr_exit(void) {
+    return edge_pending ? SL_POWER_MANAGER_WAKEUP : SL_POWER_MANAGER_IGNORE;
+}
+
+#endif
+
+void hal_gpio_watch_pin(hal_gpio_pin_t gpio_pin) {
     hal_gpio_ensure_clock();
     hal_gpio_ensure_gpio_init();
+
+    for (uint8_t i = 0; i < MAX_INT_LINES; i++) {
+        if (s_slots[i].in_use && s_slots[i].hal_pin == gpio_pin) {
+            return;
+        }
+    }
 
     const sl_gpio_t sl_gpio = silabs_hal_gpio_to_sl_gpio(gpio_pin);
 
     // Allocate a regular EXTI line (for edge interrupts while awake)
     int32_t slot_no = alloc_int_slot();
     if (slot_no == LINE_MISSING) {
-        printf("hal_gpio_callback: no free EXTI lines\r\n");
+        printf("hal_gpio_watch_pin: no free EXTI lines\r\n");
         return;
     }
     int_slot_t *slot = &s_slots[slot_no];
-    slot->hal_pin = gpio_pin;
-    slot->user_cb = callback;
-    slot->arg     = arg;
-    sl_zigbee_af_isr_event_init(&slot->af_event, _af_event_handler);
+    slot->hal_pin    = gpio_pin;
+    slot->last_level = hal_gpio_read(gpio_pin);
 
     // Register regular edge-sensitive callback (both edges)
 
     sl_status_t status = sl_gpio_configure_external_interrupt(
         &sl_gpio, &slot->line, SL_GPIO_INTERRUPT_RISING_FALLING_EDGE,
         (sl_gpio_irq_callback_t)_dispatch_regular, slot);
-    printf("hal_gpio_callback: exti line %ld status %lu\r\n", slot->line,
+    printf("hal_gpio_watch_pin: exti line %ld status %lu\r\n", slot->line,
            (unsigned long)status);
 }
 
-// (Optional) helper to unregister an interrupt if you add
-// hal_gpio_int_disable() later
-void hal_gpio_unreg_callback(hal_gpio_pin_t gpio_pin) {
-    printf("hal_gpio_unreg_callback pin %02X\r\n", gpio_pin);
-
-    for (uint8_t i = 0; i < MAX_INT_LINES; i++) {
-        if (s_slots[i].in_use && s_slots[i].hal_pin == gpio_pin) {
-            sl_gpio_deconfigure_external_interrupt(s_slots[i].line);
-            free_int_slot(i);
-            return;
-        }
-    }
+hal_gpio_diagnostics_t hal_gpio_get_diagnostics(void) {
+    return diagnostics;
 }
+
+// silabs_gpio_pin.h encodes ports without emlib; fail the build on mismatch.
+typedef char silabs_gpio_pin_encoding_matches_emlib[
+        (gpioPortA == 0 && gpioPortB == 1 && gpioPortC == 2 && gpioPortD == 3) ?
+        1 : -1];
 
 hal_gpio_pin_t hal_gpio_parse_pin(const char *s) {
-    if (!s || s[0] < 'A' || s[0] > 'D' || s[1] < '0' || s[1] > '8')
-        return HAL_INVALID_PIN;
-
-    static const uint8_t ports[] = { gpioPortA, gpioPortB, gpioPortC, gpioPortD };
-    return (hal_gpio_pin_t)((ports[s[0] - 'A'] << 8) | (uint8_t)(s[1] - '0'));
-}
-
-hal_gpio_pull_t hal_gpio_parse_pull(const char *pull_str) {
-    if (pull_str[0] == 'u' || pull_str[0] == 'U') {
-        return HAL_GPIO_PULL_UP;
-    }
-    if (pull_str[0] == 'd') {
-        return HAL_GPIO_PULL_DOWN;
-    }
-    if (pull_str[0] == 'f') {
-        return HAL_GPIO_PULL_NONE;
-    }
-    return HAL_GPIO_PULL_INVALID;
+    return silabs_gpio_pin_from_text(s);
 }

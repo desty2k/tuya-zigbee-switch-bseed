@@ -3,12 +3,15 @@
 #include "poll_control_cluster.h"
 
 #include "cluster_common.h"
-#include "consts.h"
+#include "zcl_cluster_defs.h"
+#include "zcl_ids.h"
+#include "zcl_types.h"
 #include "device_config/nvm_items.h"
 #include "hal/nvm.h"
 #include "hal/printf_selector.h"
 #include "hal/timer.h"
 #include "hal/zigbee.h"
+#include <string.h>
 
 // Battery device defaults (ZCL spec)
 // All values in quarter-seconds
@@ -25,8 +28,6 @@
 #define NON_BATTERY_FAST_POLL_TIMEOUT      (10 * 4)   // 10 seconds
 
 #define QS_TO_MS(qs)    ((uint32_t)(qs) * 250)
-
-static const uint16_t poll_ctrl_cluster_revision = 0x01;
 
 // Single instance pointer for trampoline
 static zigbee_poll_control_cluster *poll_ctrl_instance = NULL;
@@ -127,8 +128,8 @@ static void check_in_handler(void *arg) {
     enter_fast_poll(cluster, cluster->fast_poll_timeout);
 
     // Schedule next check-in
-    hal_tasks_schedule(&cluster->check_in_task,
-                       QS_TO_MS(cluster->check_in_interval));
+    app_timer_start(&cluster->check_in_timer,
+                    QS_TO_MS(cluster->check_in_interval));
 }
 
 // Command handler
@@ -171,8 +172,8 @@ static hal_zigbee_cmd_result_t poll_control_cmd_callback(
                                 ((uint32_t)data[1] << 8) |
                                 ((uint32_t)data[2] << 16) |
                                 ((uint32_t)data[3] << 24);
-        printf("Poll control: set long poll interval=%lu\r\n",
-               (unsigned long)new_interval);
+        printf("Poll control: set long poll interval=%d\r\n",
+               (int)new_interval);
         if (new_interval < 0x04 || new_interval > 0x6E0000 ||
             (cluster->check_in_interval != 0 &&
              new_interval > cluster->check_in_interval) ||
@@ -213,36 +214,32 @@ static hal_zigbee_cmd_result_t poll_control_cmd_callback(
 }
 
 static hal_zigbee_cmd_result_t poll_control_cmd_trampoline(
-    uint8_t endpoint, uint16_t cluster_id, uint8_t command_id,
-    void *cmd_payload, uint16_t cmd_payload_len) {
-    if (poll_ctrl_instance == NULL)
+    const hal_zigbee_incoming_command_t *command) {
+    if (poll_ctrl_instance == NULL || command == NULL ||
+        command->destination_endpoint != poll_ctrl_instance->endpoint)
         return HAL_ZIGBEE_CMD_SKIPPED;
 
-    return poll_control_cmd_callback(poll_ctrl_instance, command_id,
-                                     cmd_payload, cmd_payload_len);
+    return poll_control_cmd_callback(poll_ctrl_instance, command->command_id,
+                                     (void *)command->payload,
+                                     command->payload_len);
 }
 
 // Attribute write handler
 
-void poll_control_cluster_callback_attr_write(uint16_t attribute_id) {
+static void poll_control_cluster_on_write_attr(uint16_t attribute_id) {
     if (poll_ctrl_instance == NULL)
         return;
 
     zigbee_poll_control_cluster *cluster = poll_ctrl_instance;
 
     if (attribute_id == ZCL_ATTR_POLL_CTRL_CHECK_IN_INTERVAL) {
-        printf("Poll control: check-in interval written=%lu\r\n",
-               (unsigned long)cluster->check_in_interval);
-        if (cluster->check_in_interval != 0 &&
-            (cluster->check_in_interval < cluster->long_poll_interval)) {
-            printf("Poll control: invalid check-in interval, reverting\r\n");
-            cluster->check_in_interval = cluster->long_poll_interval;
-        }
+        printf("Poll control: check-in interval written=%d\r\n",
+               (int)cluster->check_in_interval);
         // Reschedule check-in timer
-        hal_tasks_unschedule(&cluster->check_in_task);
+        timer_cancel(&cluster->check_in_timer);
         if (cluster->check_in_interval != 0) {
-            hal_tasks_schedule(&cluster->check_in_task,
-                               QS_TO_MS(cluster->check_in_interval));
+            app_timer_start(&cluster->check_in_timer,
+                            QS_TO_MS(cluster->check_in_interval));
         }
         poll_control_store_to_nv(cluster);
     } else if (attribute_id == ZCL_ATTR_POLL_CTRL_FAST_POLL_TIMEOUT) {
@@ -252,11 +249,50 @@ void poll_control_cluster_callback_attr_write(uint16_t attribute_id) {
     }
 }
 
+static hal_zigbee_cmd_result_t poll_control_cluster_attr_write(
+    uint8_t endpoint, uint16_t attribute_id, const uint8_t *candidate,
+    uint16_t candidate_len, hal_zigbee_attr_write_phase_t phase) {
+    zigbee_poll_control_cluster *cluster = poll_ctrl_instance;
+
+    if (cluster == NULL || endpoint != cluster->endpoint || candidate == NULL)
+        return HAL_ZIGBEE_CMD_SKIPPED;
+
+    if (attribute_id == ZCL_ATTR_POLL_CTRL_CHECK_IN_INTERVAL) {
+        uint32_t interval;
+
+        if (candidate_len != sizeof(interval)) return HAL_ZIGBEE_INVALID_VALUE;
+
+        interval = (uint32_t)candidate[0] | ((uint32_t)candidate[1] << 8) |
+                   ((uint32_t)candidate[2] << 16) | ((uint32_t)candidate[3] << 24);
+        if (interval != 0 && interval < cluster->long_poll_interval)
+            return HAL_ZIGBEE_INVALID_VALUE;
+    } else if (attribute_id == ZCL_ATTR_POLL_CTRL_FAST_POLL_TIMEOUT) {
+        if (candidate_len != sizeof(cluster->fast_poll_timeout))
+            return HAL_ZIGBEE_INVALID_VALUE;
+    } else {
+        return HAL_ZIGBEE_CMD_SKIPPED;
+    }
+    if (phase == HAL_ZIGBEE_ATTR_COMMIT) {
+        if (attribute_id == ZCL_ATTR_POLL_CTRL_CHECK_IN_INTERVAL) {
+            memcpy(&cluster->check_in_interval, candidate, candidate_len);
+        } else {
+            memcpy(&cluster->fast_poll_timeout, candidate, candidate_len);
+        }
+        poll_control_cluster_on_write_attr(attribute_id);
+    }
+    return HAL_ZIGBEE_CMD_PROCESSED;
+}
+
 // Public API
 
 void poll_control_cluster_add_to_endpoint(zigbee_poll_control_cluster *cluster,
                                           hal_zigbee_endpoint *endpoint,
                                           bool is_battery_device) {
+    if (!hal_zigbee_endpoint_reserve_clusters(endpoint,
+                                              endpoint->cluster_capacity, 1)) {
+        return;
+    }
+
     poll_ctrl_instance        = cluster;
     cluster->endpoint         = endpoint->endpoint;
     cluster->in_fast_poll     = false;
@@ -280,26 +316,28 @@ void poll_control_cluster_add_to_endpoint(zigbee_poll_control_cluster *cluster,
 
     // Setup attributes
     SETUP_ATTR(0, ZCL_ATTR_POLL_CTRL_CHECK_IN_INTERVAL, ZCL_DATA_TYPE_UINT32,
-               ATTR_WRITABLE, cluster->check_in_interval);
+               (HAL_ATTR_READ | HAL_ATTR_WRITE), cluster->check_in_interval);
     SETUP_ATTR(1, ZCL_ATTR_POLL_CTRL_LONG_POLL_INTERVAL, ZCL_DATA_TYPE_UINT32,
-               ATTR_READONLY, cluster->long_poll_interval);
+               HAL_ATTR_READ, cluster->long_poll_interval);
     SETUP_ATTR(2, ZCL_ATTR_POLL_CTRL_SHORT_POLL_INTERVAL,
-               ZCL_DATA_TYPE_UINT16, ATTR_READONLY,
+               ZCL_DATA_TYPE_UINT16, HAL_ATTR_READ,
                cluster->short_poll_interval);
     SETUP_ATTR(3, ZCL_ATTR_POLL_CTRL_FAST_POLL_TIMEOUT, ZCL_DATA_TYPE_UINT16,
-               ATTR_WRITABLE, cluster->fast_poll_timeout);
+               (HAL_ATTR_READ | HAL_ATTR_WRITE), cluster->fast_poll_timeout);
     SETUP_ATTR(4, ZCL_ATTR_GLOBAL_CLUSTER_REVISION, ZCL_DATA_TYPE_UINT16,
-               ATTR_READONLY, cluster->cluster_revision);
+               HAL_ATTR_READ, cluster->cluster_revision);
 
-    // Register cluster on endpoint
-    endpoint->clusters[endpoint->cluster_count].cluster_id =
-        ZCL_CLUSTER_POLL_CONTROL;
-    endpoint->clusters[endpoint->cluster_count].attribute_count = 5;
-    endpoint->clusters[endpoint->cluster_count].attributes      = cluster->attr_infos;
-    endpoint->clusters[endpoint->cluster_count].is_server       = 1;
-    endpoint->clusters[endpoint->cluster_count].cmd_callback    =
-        poll_control_cmd_trampoline;
-    endpoint->cluster_count++;
+    hal_zigbee_cluster endpoint_cluster = {
+        .cluster_id          = ZCL_CLUSTER_POLL_CONTROL,
+        .role                = HAL_ZIGBEE_ROLE_SERVER,
+        .attribute_count     =                               5,
+        .attributes          = cluster->attr_infos,
+        .cmd_callback        = poll_control_cmd_trampoline,
+        .attr_write_callback = poll_control_cluster_attr_write,
+    };
+
+    hal_zigbee_endpoint_add_cluster(endpoint, endpoint->cluster_capacity,
+                                    &endpoint_cluster);
 
     // Register ZCL activity callback
     hal_zigbee_register_on_zcl_activity_callback(on_zcl_activity);
@@ -310,12 +348,10 @@ void poll_control_cluster_add_to_endpoint(zigbee_poll_control_cluster *cluster,
     enter_fast_poll(cluster, cluster->fast_poll_timeout);
 
     // Schedule check-in timer
-    cluster->check_in_task.handler = (task_handler_t)check_in_handler;
-    cluster->check_in_task.arg     = cluster;
-    hal_tasks_init(&cluster->check_in_task);
+    timer_init(&cluster->check_in_timer, check_in_handler, cluster);
     if (cluster->check_in_interval != 0) {
-        hal_tasks_schedule(&cluster->check_in_task,
-                           QS_TO_MS(cluster->check_in_interval));
+        app_timer_start(&cluster->check_in_timer,
+                        QS_TO_MS(cluster->check_in_interval));
     }
 }
 

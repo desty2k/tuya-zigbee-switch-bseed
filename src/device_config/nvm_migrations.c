@@ -1,12 +1,36 @@
 #include "hal/nvm.h"
 #include "hal/printf_selector.h"
 #include "nvm_items.h"
+#include "capability_state.h"
 
 #ifdef HAL_SILABS
 #include "silabs_config.h"
 #endif
 
-#define UNKNOWN_VERSION    0
+#define UNKNOWN_VERSION                 0
+#define INTERLOCK_CONFIG_VERSION        3
+#define BUTTON_EVENT_CONFIG_VERSION     4
+#define CAPABILITY_OWNERSHIP_VERSION    5
+#define COVER_POSITION_VERSION          7
+#define METER_SERVICE_VERSION           8
+#define MANAGEMENT_SERVICE_VERSION      9
+#define COVER_SWITCH_HOLD_VERSION       10
+
+static void delete_switch_configs(void) {
+    for (uint8_t switch_idx = 0; switch_idx < MAX_SWITCHES; switch_idx++) {
+        hal_nvm_delete(NV_ITEM_SWITCH_CLUSTER_DATA(switch_idx));
+    }
+    for (uint8_t switch_idx = 0; switch_idx < MAX_COVER_SWITCHES;
+         switch_idx++) {
+        hal_nvm_delete(NV_ITEM_COVER_SWITCH_CONFIG(switch_idx));
+    }
+}
+
+static void delete_relay_configs(void) {
+    for (uint8_t relay_idx = 0; relay_idx < MAX_RELAYS; relay_idx++) {
+        hal_nvm_delete(NV_ITEM_RELAY_CLUSTER_DATA(relay_idx));
+    }
+}
 
 uint16_t read_version_in_nv() {
     uint16_t version;
@@ -27,7 +51,7 @@ void write_version_to_nv(uint16_t version) {
                                          sizeof(version), (uint8_t *)&version);
 
     if (res != HAL_NVM_SUCCESS) {
-        printf("Failed to write lastSeenVersion to NV, st: %d\r\n", res);
+        printf("Failed to write lastSeenVersion to NV, st: %d\r\n", (int)res);
     }
 }
 
@@ -49,9 +73,32 @@ void handle_version_changes() {
         return;
     }
 
-    // Handle migrations here
-    // Example:
-    // if (oldVersion < XX) {
-    //   migrate_to_vXX();
-    // }
+    if (oldVersion < INTERLOCK_CONFIG_VERSION) {
+        delete_relay_configs();
+    }
+    if (oldVersion < BUTTON_EVENT_CONFIG_VERSION) {
+        delete_switch_configs();
+    }
+    if (oldVersion < CAPABILITY_OWNERSHIP_VERSION) {
+        capability_state_clear_owned();
+    }
+
+    /* Deleted by item id: images built without the cover or meter feature
+     * must still clear these records. */
+    if (oldVersion < COVER_POSITION_VERSION) {
+        for (uint8_t i = 0; i < MAX_COVERS; i++) hal_nvm_delete(NV_ITEM_COVER_STATE(i));
+    }
+    if (oldVersion < METER_SERVICE_VERSION) {
+        for (uint8_t i = 0; i < MAX_METERS; i++) hal_nvm_delete(NV_ITEM_METER_STATE(i));
+    }
+    if (oldVersion < MANAGEMENT_SERVICE_VERSION) {
+        hal_nvm_delete(NV_ITEM_DEVICE_CONFIG);
+        hal_nvm_delete(NV_ITEM_BASIC_CLUSTER_DATA);
+        hal_nvm_delete(NV_ITEM_MULTI_PRESS_RESET_COUNT);
+        hal_nvm_delete(NV_ITEM_DEVICE_CONFIG_SERVICE);
+    }
+    if (oldVersion < COVER_SWITCH_HOLD_VERSION) {
+        capability_state_add_cover_switch_hold();
+    }
+    write_version_to_nv(currentVersion);
 }

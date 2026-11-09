@@ -8,7 +8,10 @@ GCC_BIN            ?= arm-none-eabi-gcc
 # Version and board configuration
 VERSION_STR ?= 0.0.0
 FILE_VERSION ?= 0
-NVM_MIGRATIONS_VERSION ?= $(shell cat ../../NVM_MIGRATIONS_VERSION 2>/dev/null || echo "1")
+NVM_MIGRATIONS_VERSION ?= $(shell cat ../../NVM_MIGRATIONS_VERSION)
+ifeq ($(NVM_MIGRATIONS_VERSION),)
+$(error NVM_MIGRATIONS_VERSION file is missing or empty)
+endif
 DEBUG ?= 0
 MCU ?= EFR32MG21A020F768IM32
 
@@ -24,6 +27,14 @@ OTA_IMAGE_TYPE ?= ${IMAGE_TYPE}
 
 BOOTLOADER_TYPE ?= internal
 
+# Board features; board.mk passes the board's list (src/features.mk). The
+# slcp files list every feature source; code of a feature at 0 is unreferenced
+# and dropped by the linker's section garbage collection.
+include ../features.mk
+ifneq ($(filter probe,$(FEATURES)),)
+$(error The probe feature has no Silabs HAL; probe boards are Telink)
+endif
+
 # Build configuration as comma-separated list
 empty :=
 space := $(empty) $(empty)
@@ -34,7 +45,8 @@ CONFIG_ITEMS := \
 	SL_ZIGBEE_AF_PLUGIN_OTA_CLIENT_POLICY_IMAGE_TYPE_ID:$(IMAGE_TYPE) \
 	VERSION_STR:"$(VERSION_STR)" \
 	NVM_MIGRATIONS_VERSION:$(NVM_MIGRATIONS_VERSION) \
-	DEFAULT_CONFIG:"$(CONFIG_STR)"
+	DEFAULT_CONFIG:"$(CONFIG_STR)" \
+	$(subst =,:,$(FEATURE_DEFINES))
 
 EXTRA_CONFIGURATION := $(subst $(space),$(comma),$(strip $(CONFIG_ITEMS)))
 
@@ -118,8 +130,6 @@ endif
 # Generate project files
 gen:
 	rm -rf $(ZIGBEE_BUILD_DIR)
-	$(SLC_DIR)/slc configuration -gcc $(TOOLCHAIN_DIR)
-	$(SLC_DIR)/slc configuration --sdk $(SIMPLICITY_SDK_DIR)
 
 	@# Unset virtual environment variables to avoid conflicts and set ZAP environment
 	env -u VIRTUAL_ENV -u PYTHONHOME -u PYTHONPATH \
@@ -128,6 +138,7 @@ gen:
     PATH="$$(echo "$$PATH" | tr ':' '\n' | grep -v 'venv' | paste -sd: -)" \
 	$(SLC_DIR)/slc generate \
 		--project-file "$(PROJECT_FILE)" \
+		--sdk "$(abspath $(SIMPLICITY_SDK_DIR))" \
 		-np -nocp \
 		-d "$(ZIGBEE_BUILD_DIR)" \
 		-name $(ZIGBEE_PROJECT_NAME) \
@@ -137,10 +148,19 @@ gen:
 		--toolchain=gcc \
 		--output-type=vscode,makefile \
 		--configuration $(EXTRA_CONFIGURATION)
+	@grep -Eq '^#define[[:space:]]+NVM_MIGRATIONS_VERSION[[:space:]]+$(NVM_MIGRATIONS_VERSION)$$' \
+		"$(ZIGBEE_BUILD_DIR)/config/silabs_config.h" || \
+		{ echo "Generated silabs_config.h does not use NVM_MIGRATIONS_VERSION $(NVM_MIGRATIONS_VERSION)"; exit 1; }
+	@for define in $(FEATURE_DEFINES); do \
+		grep -Eq "^#define[[:space:]]+$${define%%=*}[[:space:]]+$${define#*=}$$" \
+			"$(ZIGBEE_BUILD_DIR)/config/silabs_config.h" || \
+			{ echo "Generated silabs_config.h does not set $$define"; exit 1; }; \
+	done
 
 # Build targets
 build:
-	cd $(ZIGBEE_BUILD_DIR) && make -f $(ZIGBEE_PROJECT_NAME).Makefile -j32 release
+	@test -n "$(TOOLCHAIN_BIN)" || { echo "$(GCC_BIN) not found in PATH"; exit 1; }
+	cd $(ZIGBEE_BUILD_DIR) && make -f $(ZIGBEE_PROJECT_NAME).Makefile -j32 release ARM_GCC_DIR="$(TOOLCHAIN_DIR)"
 	@if ! cmp -s $(ZIGBEE_BUILD_DIR)/build/release/$(ZIGBEE_PROJECT_NAME).s37 $(BIN_FILE); then \
 		mkdir -p $(dir $(BIN_FILE)); \
 		cp $(ZIGBEE_BUILD_DIR)/build/release/$(ZIGBEE_PROJECT_NAME).s37 $(BIN_FILE); \
@@ -197,7 +217,8 @@ bootloader_gen:
 		--output-type=vscode,makefile
 
 bootloader_build: bootloader_gen
-	cd $(BOOTLOADER_BUILD_DIR) && make -f $(BOOTLOADER_PROJECT_NAME).Makefile -j32 release
+	@test -n "$(TOOLCHAIN_BIN)" || { echo "$(GCC_BIN) not found in PATH"; exit 1; }
+	cd $(BOOTLOADER_BUILD_DIR) && make -f $(BOOTLOADER_PROJECT_NAME).Makefile -j32 release ARM_GCC_DIR="$(TOOLCHAIN_DIR)"
 
 bootloader_install:
 	@echo "Flashing bootloader..."

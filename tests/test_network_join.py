@@ -3,13 +3,22 @@ import pytest
 from tests.client import StubProc
 from tests.conftest import Device
 from tests.zcl_consts import (
-    ZCL_ATTR_BASIC_MULTI_PRESS_RESET_COUNT,
-    ZCL_CLUSTER_BASIC,
+    ZCL_ATTR_DEVICE_CONFIG_MULTI_PRESS_RESET,
+    ZCL_ATTR_DIAGNOSTICS_ANNOUNCES,
+    ZCL_ATTR_DIAGNOSTICS_ANNOUNCE_FAILURES,
+    ZCL_ATTR_DIAGNOSTICS_NETWORK_JOINS,
+    ZCL_ATTR_DIAGNOSTICS_NETWORK_LOSSES,
+    ZCL_ATTR_DIAGNOSTICS_NETWORK_TRANSITIONS,
+    ZCL_CLUSTER_DEVICE_CONFIG,
+    ZCL_CLUSTER_DEVICE_DIAGNOSTICS,
 )
 
 HAL_ZIGBEE_NETWORK_NOT_JOINED = 0
 HAL_ZIGBEE_NETWORK_JOINED = 1
 HAL_ZIGBEE_NETWORK_JOINING = 2
+
+# Join blink after a join by steering: 7 x (500 ms on, 500 ms off).
+JOIN_BLINK_MS = 7000
 
 
 def test_tries_to_join_on_startup_not_joined() -> None:
@@ -36,6 +45,7 @@ def test_led_stops_blinking_after_join() -> None:
         device = Device(proc)
 
         device.set_network(HAL_ZIGBEE_NETWORK_JOINED)
+        device.step_time(JOIN_BLINK_MS)
 
         state = device.get_gpio("B0", refresh=True)
         for _ in range(4):
@@ -50,6 +60,7 @@ def test_shared_switch_indicator_turns_off_after_join() -> None:
         assert device.get_gpio("A1", refresh=True)
 
         device.set_network(HAL_ZIGBEE_NETWORK_JOINED)
+        device.step_time(JOIN_BLINK_MS)
 
         assert not device.get_gpio("A1", refresh=True)
 
@@ -110,8 +121,8 @@ def test_leaves_on_multipress_configurable() -> None:
         # Set multi-press count to reset to 5 via Basic cluster
         device.write_zigbee_attr(
             1,
-            ZCL_CLUSTER_BASIC,
-            ZCL_ATTR_BASIC_MULTI_PRESS_RESET_COUNT,
+            ZCL_CLUSTER_DEVICE_CONFIG,
+            ZCL_ATTR_DEVICE_CONFIG_MULTI_PRESS_RESET,
             5,
         )
 
@@ -121,8 +132,9 @@ def test_leaves_on_multipress_configurable() -> None:
 
         assert device.status()["joined"] == str(HAL_ZIGBEE_NETWORK_JOINED)
 
-        # 5th press should cause the device to leave the network
+        # The configured click sequence resolves after the gesture gap.
         device.click_button("A0")
+        device.step_time(350)
         assert device.status()["joined"] != str(HAL_ZIGBEE_NETWORK_JOINED)
 
 
@@ -134,8 +146,8 @@ def test_multipress_reset_disabled_when_zero() -> None:
         # Disable multi-press reset by setting to 0 via Basic cluster
         device.write_zigbee_attr(
             1,
-            ZCL_CLUSTER_BASIC,
-            ZCL_ATTR_BASIC_MULTI_PRESS_RESET_COUNT,
+            ZCL_CLUSTER_DEVICE_CONFIG,
+            ZCL_ATTR_DEVICE_CONFIG_MULTI_PRESS_RESET,
             0,
         )
 
@@ -155,7 +167,9 @@ def test_leaves_on_onboard_button_long_press() -> None:
         device.press_button("A0")
         device.step_time(3000)
 
-        assert device.status()["joined"] != str(HAL_ZIGBEE_NETWORK_JOINING)
+        # The main loop restarts steering as soon as the device has left.
+        assert any(event.kind == "zcl_leave_network" for event in device._events)
+        assert device.status()["joined"] == str(HAL_ZIGBEE_NETWORK_JOINING)
 
 
 def test_announces_after_join() -> None:
@@ -165,3 +179,55 @@ def test_announces_after_join() -> None:
         device.set_network(HAL_ZIGBEE_NETWORK_JOINED)
 
         device.wait_for_announce()
+
+
+def test_network_monitor_deduplicates_transitions_and_exposes_diagnostics() -> None:
+    with StubProc(device_config="A;B;LB0;") as proc:
+        device = Device(proc)
+
+        device.set_network(HAL_ZIGBEE_NETWORK_NOT_JOINED)
+        device.set_network(HAL_ZIGBEE_NETWORK_JOINED)
+        device.step_time(0)
+        device.set_network(HAL_ZIGBEE_NETWORK_JOINED)
+        device.step_time(0)
+
+        counters = device.counters()
+        assert counters["network_transitions"] == 2
+        assert counters["network_losses"] == 1
+        assert counters["network_joins"] == 1
+        assert counters["last_network_transition_ms"] == 0
+        device.step_time(1000)  # diagnostics attributes refresh once per second
+        assert int(device.read_zigbee_attr(
+            1, ZCL_CLUSTER_DEVICE_DIAGNOSTICS, ZCL_ATTR_DIAGNOSTICS_NETWORK_TRANSITIONS
+        )) == 2
+        assert int(device.read_zigbee_attr(
+            1, ZCL_CLUSTER_DEVICE_DIAGNOSTICS, ZCL_ATTR_DIAGNOSTICS_NETWORK_LOSSES
+        )) == 1
+        assert int(device.read_zigbee_attr(
+            1, ZCL_CLUSTER_DEVICE_DIAGNOSTICS, ZCL_ATTR_DIAGNOSTICS_NETWORK_JOINS
+        )) == 1
+
+
+def test_failed_announce_retries_after_bounded_delay() -> None:
+    with StubProc(device_config="A;B;LB0;", joined=False) as proc:
+        device = Device(proc)
+
+        assert proc.exec("announce_fail 1").ok
+        device.set_network(HAL_ZIGBEE_NETWORK_JOINED)
+        device.step_time(0)
+        assert device.counters()["announce_failures"] == 1
+        assert device.counters()["announce_attempts"] == 1
+
+        device.clear_events()
+        device.step_time(999)
+        assert device.counters()["announce_attempts"] == 1
+        device.step_time(1)
+        device.step_time(0)
+        device.wait_for_announce()
+        device.step_time(1000)  # diagnostics attributes refresh once per second
+        assert int(device.read_zigbee_attr(
+            1, ZCL_CLUSTER_DEVICE_DIAGNOSTICS, ZCL_ATTR_DIAGNOSTICS_ANNOUNCES
+        )) == 2
+        assert int(device.read_zigbee_attr(
+            1, ZCL_CLUSTER_DEVICE_DIAGNOSTICS, ZCL_ATTR_DIAGNOSTICS_ANNOUNCE_FAILURES
+        )) == 1

@@ -1,5 +1,6 @@
 #include <getopt.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -32,18 +33,20 @@ int main(int argc, char **argv) {
     signal(SIGINT, on_sigint);
 
     const struct option long_opts[] = {
-        { "device-config", required_argument, 0, 'd' },
-        { "not-joined",    no_argument,       0, 'j' },
-        { "freeze-time",   no_argument,       0, 'f' },
-        { "help",          no_argument,       0, 'h' },
-        {               0,                 0, 0,   0 }
+        { "device-config",    required_argument, 0, 'd' },
+        { "not-joined",       no_argument,       0, 'j' },
+        { "freeze-time",      no_argument,       0, 'f' },
+        { "fail-zigbee-init", no_argument,       0, 'z' },
+        { "reset-fault",      required_argument, 0, 'r' },
+        { "help",             no_argument,       0, 'h' },
+        {                  0,                 0, 0,   0 }
     };
 
     char device_conf_buf[APP_DEVICE_CONF_MAX];
     device_conf_buf[0] = '\0';
     bool joined = true;
     for (;;) {
-        int opt = getopt_long(argc, argv, "d:j:f:h", long_opts, NULL);
+        int opt = getopt_long(argc, argv, "d:j:f:zr:h", long_opts, NULL);
         if (opt == -1)
             break;
         switch (opt) {
@@ -55,6 +58,12 @@ int main(int argc, char **argv) {
             break;
         case 'f':
             stub_millis_freeze();
+            break;
+        case 'z':
+            stub_zigbee_reject_next_inits(1);
+            break;
+        case 'r':
+            stub_set_reset_fault((uint8_t)strtoul(optarg, NULL, 0));
             break;
         case 'h':
         default:

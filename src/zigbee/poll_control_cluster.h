@@ -3,7 +3,7 @@
 
 #ifdef END_DEVICE
 
-#include "hal/tasks.h"
+#include "base_components/timer_service.h"
 #include "hal/zigbee.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -22,7 +22,7 @@ typedef struct {
     uint32_t             fast_poll_end_ms;
 
     // Tasks
-    hal_task_t           check_in_task;
+    app_timer_t          check_in_timer;
 
     // ZCL attribute table
     hal_zigbee_attribute attr_infos[5]; // 4 mandatory + cluster_revision
@@ -32,7 +32,6 @@ void poll_control_cluster_add_to_endpoint(zigbee_poll_control_cluster *cluster,
                                           hal_zigbee_endpoint *endpoint,
                                           bool is_battery_device);
 void poll_control_cluster_update(void);
-void poll_control_cluster_callback_attr_write(uint16_t attribute_id);
 
 #endif // END_DEVICE
 #endif // _POLL_CONTROL_CLUSTER_H_

@@ -2980,6 +2980,7 @@ OUTLET_BSEED_BORUIDAPLS_PM_TS011F:
   mcu: TLSR8258
   config_str: zifx0xoj;TS011F-BD-PM;LC3i;SB7u;RC2;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: 
   - TS011F-BORUIDAPLS-PM
@@ -3011,6 +3012,7 @@ OUTLET_BSEED_PM_TS011F:
   mcu: TLSR8258
   config_str: b28wrpvx;TS011F-BS-PM;LC3;SB5u;RD2;IB4;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -3041,6 +3043,7 @@ OUTLET_BSEED_PM_TS011F_1:
   mcu: TLSR8258
   config_str: ko6v90pg;TS011F-BS-PM-1;LC4i;SB4u;RB5;IB1i;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -3071,6 +3074,7 @@ OUTLET_BSEED_PM_TS011F_2:
   mcu: TLSR8258
   config_str: 4ux0ondb;TS011F-BS-PM-2;LB4;SB5u;RD2;IC3;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -3101,6 +3105,7 @@ OUTLET_BSEED_TS011F:
   mcu: TLSR8258
   config_str: o1jzcxou;TS011F-BS;LC2;SB4u;RC3;ID2;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -3111,6 +3116,117 @@ OUTLET_BSEED_TS011F:
   info: Supported
   threads: https://github.com/romasku/tuya-zigbee-switch/issues/145
   store: https://www.aliexpress.com/item/1005004402438527.html
+OUTLET_BSEED_TS011F_PROBE:
+  human_name: BSEED outlet GPIO probe (drzlxjne)
+  category: outlet
+  power: mains
+  neutral: required
+  output: relay
+  device_type: router
+  stock_model_name: TS011F
+  stock_manufacturer_name: _TZ3210_drzlxjne
+  stock_converter_manufacturer: Tuya
+  stock_converter_model: TS011F_plug_1
+  override_z2m_device: null
+  tuya_module: null
+  mcu_family: Telink
+  mcu: TLSR8258
+  config_str: _TZ3210_drzlxjne;TS011F-probe;SB4u;RB5;IC4;M;
+  alt_config_str: null
+  features: [probe, relay, switch]
+  old_manufacturer_names: null
+  old_zb_models: null
+  stock_manufacturer_id: 4417
+  stock_image_type: 54179
+  firmware_image_type: 47116
+  build: no
+  status: in_progress
+  info: GPIO probe image for pin discovery with the relay and switch features; built on demand (docs/contribute/porting.md)
+  threads: null
+  store: null
+COVER_BSEED_TS130F_PROBE:
+  human_name: BSEED shutter switch GPIO probe (vsj5o7dm)
+  category: cover
+  power: mains
+  neutral: required
+  output: relay
+  device_type: router
+  stock_model_name: TS130F
+  stock_manufacturer_name: _TZ3000_vsj5o7dm
+  stock_converter_manufacturer: Tuya
+  stock_converter_model: TS130F
+  override_z2m_device: null
+  tuya_module: null
+  mcu_family: Telink
+  mcu: TLSR8258
+  config_str: _TZ3000_vsj5o7dm;TS130F-probe;LD2;SB6u;SA1u;SA0u;RD3;RC0;IC3;IB5;K03:500;M;
+  alt_config_str: null
+  features: [probe, relay, switch]
+  old_manufacturer_names: null
+  old_zb_models: null
+  stock_manufacturer_id: 4417
+  stock_image_type: 54179
+  firmware_image_type: 47118
+  build: no
+  status: in_progress
+  info: GPIO probe image with the relay and switch features; buttons up B6, stop A0, down A1; relays up D3, down C0 (interlocked, 500 ms); LEDs up C3, down B5, status D2; built on demand (docs/contribute/porting.md)
+  threads: null
+  store: null
+COVER_BSEED_TS130F_VSJ5O7DM:
+  human_name: BSEED shutter switch (vsj5o7dm)
+  category: cover
+  power: mains
+  neutral: required
+  output: relay
+  device_type: router
+  stock_model_name: TS130F
+  stock_manufacturer_name: _TZ3000_vsj5o7dm
+  stock_converter_manufacturer: Tuya
+  stock_converter_model: TS130F
+  override_z2m_device: null
+  tuya_module: null
+  mcu_family: Telink
+  mcu: TLSR8258
+  config_str: vsj5o7dm;TS130F-BS-CVR;LB4i;XB6A1A0u;CD3C0;IC3;IB5;PD2;M;
+  alt_config_str: null
+  old_manufacturer_names: null
+  old_zb_models: null
+  stock_manufacturer_id: 4417
+  stock_image_type: 54179
+  firmware_image_type: 47119
+  build: yes
+  status: in_progress
+  info: Pins found with COVER_BSEED_TS130F_PROBE; the status LED slot drives the backlight (B4, lit when low); red LED D2 is the child lock LED
+  threads: null
+  store: null
+OUTLET_BSEED_TS011F_PM_DRZLXJNE:
+  human_name: BSEED PM outlet (drzlxjne)
+  category: outlet
+  power: mains
+  neutral: required
+  output: relay
+  device_type: router
+  stock_model_name: TS011F
+  stock_manufacturer_name: _TZ3210_drzlxjne
+  stock_converter_manufacturer: Tuya
+  stock_converter_model: TS011F_plug_1
+  override_z2m_device: null
+  tuya_module: null
+  mcu_family: Telink
+  mcu: TLSR8258
+  config_str: drzlxjne;TS011F-BS-PM-3;SB4u;RB5;IC4;EBC2C3D2;M;
+  alt_config_str: null
+  features: [relay, switch, meter]
+  old_manufacturer_names: null
+  old_zb_models: null
+  stock_manufacturer_id: 4417
+  stock_image_type: 54179
+  firmware_image_type: 47117
+  build: yes
+  status: in_progress
+  info: BL0937 power monitoring (CF C2, CF1 C3, SEL D2); calibration against a reference meter pending
+  threads: null
+  store: null
 OUTLET_MAKEGOOD_PM_TS011F_2GANG:
   human_name: MakeGood MG-GPO01 double socket
   category: outlet
@@ -4033,6 +4149,7 @@ SWITCH_BSEED_TOUCH_BACKLIGHT_TS0001:
   mcu: TLSR8258
   config_str: blhvsaqf;TS0001-BSDB;LC4;SC1u;RC3;IC2;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models:
   - TS0001-BS-T
@@ -4061,6 +4178,7 @@ SWITCH_BSEED_TOUCH_BACKLIGHT_TS0002:
   mcu: TLSR8258
   config_str: l9brjwau;TS0002-BSDB;LD4i;SB5u;RC3;IC1;SD3u;RC2;ID7;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models:
   - TS0002-BS-1
@@ -4089,6 +4207,7 @@ SWITCH_BSEED_TOUCH_BACKLIGHT_TS0003:
   mcu: TLSR8258
   config_str: qkixdnon;TS0003-BSDB;LC4i;SB5u;RC3;SC1u;RC2;SD3u;RD7;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models:
   - TS0003-BSEED
@@ -4117,6 +4236,7 @@ SWITCH_BSEED_TOUCH_LATCHING_TS0011:
   mcu: TLSR8258
   config_str: aetquff4;BSLR1;LC3;SB4u;RC0B6;IC2;M;SLP;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -4144,6 +4264,7 @@ SWITCH_BSEED_TOUCH_LATCHING_TS0012:
   mcu: TLSR8258
   config_str: xk5udnd6;BSLR2;LC3;SB5u;RC0B6;ID2;SD4u;RA1D7;ID3;M;SLP;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names:
   - Bseed-2-gang-2
   old_zb_models:
@@ -4174,6 +4295,7 @@ SWITCH_BSEED_TOUCH_LATCHING_TS0013:
   mcu: TLSR8258
   config_str: kfwhmnvc;BSLR3;LC3;SB5u;RC0B6;ID2;SB4u;RA1D7;IC2;SD4u;RA0C1;ID3;M;SLP;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models:
   - TS0013-2-BS
@@ -4202,6 +4324,7 @@ SWITCH_BSEED_TOUCH_MELODY_TS0001:
   mcu: TLSR8258
   config_str: ysdv91bk;TS0001-BSMN;LA0i;SC3u;RC2;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -4232,6 +4355,7 @@ SWITCH_BSEED_TOUCH_MELODY_TS0002:
   mcu: TLSR8258
   config_str: mklgayek;TS0002-BSMN;LA0i;SC3u;RC2;SB7u;RB4;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -4262,6 +4386,7 @@ SWITCH_BSEED_TOUCH_MELODY_TS0003:
   mcu: TLSR8258
   config_str: 7aqaupa9;TS0003-BSMN;LA0i;SC3u;RC2;SB7u;RB4;SB5u;RC0;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models:
   - TS0003-BS
@@ -4293,6 +4418,7 @@ SWITCH_BSEED_TOUCH_MELODY_TS0004:
   mcu: TLSR8258
   config_str: s6ma1nh4;TS0004-BSMN;LA0i;SC3u;RC2;SB7u;RB4;SB5u;RC0;SD7u;RD2;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models:
   - TS0004-BS
@@ -4323,6 +4449,7 @@ SWITCH_BSEED_TOUCH_TS0001:
   mcu: TLSR8258
   config_str: 9akmi5ly;TS0001-CUS-T;LB4i;SC2u;RC3;ID2i;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -4350,6 +4477,7 @@ SWITCH_BSEED_TOUCH_TS0001_2:
   mcu: TLSR8258
   config_str: wijoqjk1;TS0001-BS12;LB4i;SC2u;RC3;ID2i;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -4377,6 +4505,7 @@ SWITCH_BSEED_TOUCH_TS0002:
   mcu: TLSR8258
   config_str: cauq1okq;TS0002-CUS-T;LC4;SB5u;RC2;IB4i;SD2u;RC3;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -4404,6 +4533,7 @@ SWITCH_BSEED_TOUCH_TS0002_2:
   mcu: TLSR8258
   config_str: w5xztuy7;TS0002-BS22;LC4;SB5u;RC2;IB4i;SD2u;RC3;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -4431,6 +4561,7 @@ SWITCH_BSEED_TOUCH_TS0011:
   mcu: TLSR8258
   config_str: hafsqare;TS0011-BS-T;LC2;SA0u;RD3;IB4;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -4458,6 +4589,7 @@ SWITCH_BSEED_TOUCH_TS0012_1:
   mcu: TLSR8258
   config_str: f2slq5pj;Bseed-2-gang;LC3;SB6u;RD3;IC2;SA1u;RC0;IB4;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names:
   - Bseed-2-gang
   old_zb_models:
@@ -4487,6 +4619,7 @@ SWITCH_BSEED_TOUCH_TS0012_2:
   mcu: TLSR8258
   config_str: e98krvvk;Bseed-2-gang-3;LC3;SB6u;RD3;IC2;SA1u;RC0;IB4;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -4514,6 +4647,7 @@ SWITCH_BSEED_TOUCH_TS0013:
   mcu: TLSR8258
   config_str: 5e5ptb24;TS0013-BS;LD2;SB6u;RD3;IC3;SA0u;RD7;IC2;SA1u;RC0;IB5;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -4541,6 +4675,7 @@ SWITCH_BSEED_TS0726_1GANG:
   mcu: TLSR8258
   config_str: jn2x20tg;TS0726-1-BS;LC4;SB1u;RC2;IC0;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -4572,6 +4707,7 @@ SWITCH_BSEED_TS0726_2GANG:
   mcu: TLSR8258
   config_str: zjuvw9zf;TS0726-2-BS;LC4;SB1u;RC2;IC0;SB7u;RC3;ID7;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -4603,6 +4739,7 @@ SWITCH_BSEED_TS0726_3GANG:
   mcu: TLSR8258
   config_str: iedhxgyi;TS0726-3-BS;LC4;SB1u;RC2;IC0;SB7u;RC3;ID7;SB4u;RD2;IB5;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -4634,6 +4771,7 @@ SWITCH_BSEED_TS0726_4GANG:
   mcu: TLSR8258
   config_str: pzao9ls1;BS4;LC1;SD3u;RA0;ID2;SD7u;RA1;IB4;SD4u;RC2;IB5;SB6u;RC3;IC4;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: 
   - TS0726-4-BS
@@ -4666,6 +4804,7 @@ SWITCH_BSEED_TS0726_L_1GANG:
   mcu: TLSR8258
   config_str: xkxgfxsg;TS0726-1-BSL;LC3;SB5u;RC1;ID2;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -4696,6 +4835,7 @@ SWITCH_BSEED_TS0726_L_2GANG:
   mcu: TLSR8258
   config_str: tlsvxhxc;TS0726-2-BSL;LB4;SC2u;RC0;ID2;SC3u;RB6;IA1;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -4726,6 +4866,7 @@ SWITCH_BSEED_TS0726_L_3GANG:
   mcu: TLSR8258
   config_str: vsom92pp;TS0726-3-BS1;LC3;SB5u;RC1;ID2;M;  null
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -4756,6 +4897,7 @@ SWITCH_BSEED_TS0726_L_3GANG_2:
   mcu: TLSR8258
   config_str: r2fgo9ks;TS0726-3-BS;LD4;SA1u;RB4;IC1;SC2u;RD2;IB5;SA0u;RC3;IB6;M;
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -4783,6 +4925,7 @@ SWITCH_BSEED_TS0726_L_4GANG:
   mcu: TLSR8258
   config_str: _TZ3002_eda6eitk;BS4L; null
   alt_config_str: null
+  features: [relay, switch]
   old_manufacturer_names: null
   old_zb_models: null
   stock_manufacturer_id: 4417
@@ -5372,7 +5515,7 @@ SWITCH_MILFRA_TS0001:
   tuya_module: ZTU
   mcu_family: Telink
   mcu: TLSR8258
-  config_str: gsqxcwqr;TS0001-MIL;BC0u;LA0i;SC0u;RB4;IC4i;
+  config_str: gsqxcwqr;TS0001-MIL;LA0i;SC0u;RB4;IC4i;
   alt_config_str: null
   old_manufacturer_names: null
   old_zb_models: null

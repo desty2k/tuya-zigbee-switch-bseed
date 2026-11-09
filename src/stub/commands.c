@@ -1,13 +1,27 @@
 #include "commands.h"
 #include "machine_io.h"
 
+#include "hal/gpio.h"
 #include "hal/timer.h"
 #include "hal/zigbee.h"
+#include "app.h"
 
+#include "stub/hal/gpio_counter.h"
 #include "stub/hal/stub.h"
 
 #include "stub/stub_app.h"
-#include "zigbee/consts.h"
+#include "device_config/build_features.h"
+#include "device_config/config_parser.h"
+#include "device_config/device_config_service.h"
+#include "device_config/feature_wiring.h"
+#include "base_components/button_input.h"
+#include "base_components/gesture_fsm.h"
+#include "base_components/timer_service.h"
+#include "zigbee/zcl_cluster_defs.h"
+#include "zigbee/button_event_cluster.h"
+#if FEATURE_PROBE
+#include "stub/hal/gpio_probe.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +45,34 @@ static int parse_u16_hex(const char *s, uint16_t *out) {
         return -1;
 
     *out = (uint16_t)v;
+    return 0;
+}
+
+static int hex_digit_value(char digit) {
+    if (digit >= '0' && digit <= '9') return digit - '0';
+
+    if (digit >= 'a' && digit <= 'f') return digit - 'a' + 10;
+
+    if (digit >= 'A' && digit <= 'F') return digit - 'A' + 10;
+
+    return -1;
+}
+
+static int parse_hex_bytes(const char *text, uint8_t *bytes,
+                           size_t capacity, uint16_t *length) {
+    size_t text_length = strlen(text);
+
+    if ((text_length & 1) != 0 || text_length / 2 > capacity) return -1;
+
+    for (size_t i = 0; i < text_length / 2; i++) {
+        int high = hex_digit_value(text[i * 2]);
+        int low  = hex_digit_value(text[i * 2 + 1]);
+
+        if (high < 0 || low < 0) return -1;
+
+        bytes[i] = (uint8_t)((high << 4) | low);
+    }
+    *length = (uint16_t)(text_length / 2);
     return 0;
 }
 
@@ -71,6 +113,80 @@ static int cmd_status(int argc, char **argv) {
     stub_app_show_status();
     io_res_ok("uptime_ms=%u joined=%d poll_rate_ms=%u", hal_millis(),
               hal_zigbee_get_network_status(), hal_zigbee_get_poll_rate_ms());
+    return 0;
+}
+
+static int cmd_diag(int argc, char **argv) {
+    hal_gpio_diagnostics_t    diag         = hal_gpio_get_diagnostics();
+    app_network_diagnostics_t network_diag = app_network_get_diagnostics();
+
+    (void)argc;
+    (void)argv;
+    io_res_ok("gpio_init_count=%u gpio_write_count=%u tasks_active=%u "
+              "gpio_irq_count=%u gpio_edges_captured=%u gpio_edges_dropped=%u "
+              "button_events_emitted=%u gestures_emitted=%u "
+              "zb_button_events_dropped=%u zb_button_events_expired=%u "
+              "zb_button_events_send_failed=%u zb_button_events_high_water=%u "
+              "zb_button_events_submitted=%u gpio_rearm_limit_hits=%u "
+              "network_transitions=%u network_losses=%u network_joins=%u "
+              "steering_attempts=%u announce_attempts=%u announce_failures=%u "
+              "uptime_ms=%u last_network_transition_ms=%u",
+              stub_gpio_init_count(), stub_gpio_write_count(),
+              stub_tasks_active_count(), diag.gpio_irq_count,
+              diag.gpio_edges_captured,
+              button_input_gpio_edges_dropped(),
+              button_input_events_emitted(), gesture_fsm_events_emitted(),
+              button_event_cluster_dropped(), button_event_cluster_expired(),
+              button_event_cluster_send_failed(), button_event_cluster_high_water(),
+              button_event_cluster_submitted(),
+              diag.gpio_rearm_limit_hits, network_diag.network_transitions,
+              network_diag.network_losses, network_diag.network_joins,
+              network_diag.steering_attempts, network_diag.announce_attempts,
+              network_diag.announce_failures, network_diag.uptime_ms,
+              network_diag.last_transition_ms);
+    return 0;
+}
+
+static void print_graph_usage(const char *prefix,
+                              const hal_zigbee_graph_usage_t *usage) {
+    printf("%s endpoints=%u server_clusters=%u client_clusters=%u attributes=%u "
+           "zcl_registrations=%u\n", prefix, usage->endpoints,
+           usage->server_clusters, usage->client_clusters, usage->attributes,
+           usage->zcl_registrations);
+}
+
+/* Resources of the registered graph and of the stored config's preflight,
+ * next to the shared platform limits they are checked against. */
+static int cmd_zcl_graph_usage(int argc, char **argv) {
+    hal_zigbee_graph_usage_t actual    = stub_zigbee_get_graph_usage();
+    hal_zigbee_graph_usage_t preflight = { 0 };
+    device_composition_t     composition;
+    int preflight_ok;
+
+    (void)argc;
+    (void)argv;
+    preflight_ok = config_parser_parse(device_config_service_config(),
+                                       &composition) == CONFIG_PARSE_OK;
+    if (preflight_ok) {
+        feature_wiring_graph_usage(&composition, &preflight);
+    }
+    print_graph_usage("actual", &actual);
+    print_graph_usage("preflight", &preflight);
+    io_res_ok("endpoints=%u server_clusters=%u client_clusters=%u attributes=%u "
+              "zcl_registrations=%u preflight_parsed=%d "
+              "preflight_endpoints=%u preflight_server_clusters=%u "
+              "preflight_client_clusters=%u preflight_attributes=%u "
+              "preflight_zcl_registrations=%u max_endpoints=%u "
+              "max_server_clusters=%u max_client_clusters=%u max_clusters=%u "
+              "max_attributes=%u max_zcl_registrations=%u",
+              actual.endpoints, actual.server_clusters, actual.client_clusters,
+              actual.attributes, actual.zcl_registrations, preflight_ok,
+              preflight.endpoints, preflight.server_clusters,
+              preflight.client_clusters, preflight.attributes,
+              preflight.zcl_registrations, HAL_ZIGBEE_MAX_ENDPOINTS,
+              HAL_ZIGBEE_MAX_SERVER_CLUSTERS, HAL_ZIGBEE_MAX_CLIENT_CLUSTERS,
+              HAL_ZIGBEE_MAX_CLUSTERS, HAL_ZIGBEE_MAX_ATTRIBUTES,
+              HAL_ZIGBEE_MAX_ZCL_REGISTRATIONS);
     return 0;
 }
 
@@ -117,6 +233,78 @@ static int cmd_net(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_tx_fail(int argc, char **argv) {
+    char *        e;
+    unsigned long count;
+
+    if (argc != 2) {
+        io_res_err("usage");
+        return -1;
+    }
+    count = strtoul(argv[1], &e, 10);
+    if (*argv[1] == '\0' || *e || count > UINT32_MAX) {
+        io_res_err("bad_value");
+        return -1;
+    }
+    stub_zigbee_reject_next_coordinator_sends((uint32_t)count);
+    io_res_ok("count=%lu", count);
+    return 0;
+}
+
+static int cmd_announce_fail(int argc, char **argv) {
+    char *        e;
+    unsigned long count;
+
+    if (argc != 2) {
+        io_res_err("usage");
+        return -1;
+    }
+    count = strtoul(argv[1], &e, 10);
+    if (*argv[1] == '\0' || *e || count > UINT32_MAX) {
+        io_res_err("bad_value");
+        return -1;
+    }
+    stub_zigbee_reject_next_announces((uint32_t)count);
+    io_res_ok("count=%lu", count);
+    return 0;
+}
+
+static int cmd_rand_seed(int argc, char **argv) {
+    char *        e;
+    unsigned long seed;
+
+    if (argc != 2) {
+        io_res_err("usage");
+        return -1;
+    }
+    seed = strtoul(argv[1], &e, 10);
+    if (*argv[1] == '\0' || *e || seed > UINT32_MAX) {
+        io_res_err("bad_value");
+        return -1;
+    }
+    stub_random_seed((uint32_t)seed);
+    io_res_ok("seed=%lu", seed);
+    return 0;
+}
+
+static int cmd_nvm_fail(int argc, char **argv) {
+    char *        e;
+    unsigned long count;
+
+    if (argc != 2) {
+        io_res_err("usage");
+        return -1;
+    }
+    count = strtoul(argv[1], &e, 10);
+    if (*argv[1] == '\0' || *e || count > UINT32_MAX) {
+        io_res_err("bad_value");
+        return -1;
+    }
+    stub_nvm_reject_next_writes((uint32_t)count);
+    io_res_ok("count=%lu", count);
+    return 0;
+}
+
 static int cmd_pin(int argc, char **argv) {
     if (argc != 3) {
         fprintf(stderr, "Usage: p <pin> <0|1>\n");
@@ -148,6 +336,78 @@ static int cmd_zcl_list_attrs(int argc, char **argv) {
     stub_app_list_attrs();
     io_res_ok(NULL);
     return 0;
+}
+
+/* Registered descriptor as `ep:cluster:role:manufacturer` entries, where role
+ * is S (server, receives commands) or C (client, sends commands). */
+static int cmd_zcl_clusters(int argc, char **argv) {
+    uint8_t count;
+    hal_zigbee_endpoint *eps = stub_zigbee_get_endpoints(&count);
+    char   out[1024];
+    size_t used = 0;
+
+    (void)argc;
+    (void)argv;
+    out[0] = '\0';
+    for (uint8_t i = 0; i < count; i++) {
+        for (uint8_t j = 0; j < eps[i].cluster_count; j++) {
+            const hal_zigbee_cluster *cluster = &eps[i].clusters[j];
+            int written = snprintf(out + used, sizeof(out) - used,
+                                   "%s%u:0x%04X:%c:0x%04X", used ? "," : "",
+                                   eps[i].endpoint, cluster->cluster_id,
+                                   cluster->role == HAL_ZIGBEE_ROLE_SERVER ? 'S' : 'C',
+                                   cluster->manufacturer_code);
+
+            if (written < 0 || (size_t)written >= sizeof(out) - used) {
+                io_res_err("too_many_clusters");
+                return -1;
+            }
+            used += (size_t)written;
+        }
+    }
+    io_res_ok("clusters=%s", out);
+    return 0;
+}
+
+/* Attribute descriptor of one server cluster as `manufacturer=0xMMMM
+ * attrs=0xAAAA:TT:F,...`: id, ZCL data type and the HAL_ATTR_* flags, all hex. */
+static int cmd_zcl_attrs(int argc, char **argv) {
+    uint8_t              ep, count;
+    uint16_t             cl;
+    hal_zigbee_endpoint *eps = stub_zigbee_get_endpoints(&count);
+    char   out[1024];
+    size_t used = 0;
+
+    if (argc != 3 || parse_u8_dec(argv[1], &ep) || parse_u16_hex(argv[2], &cl)) {
+        fprintf(stderr, "Usage: zcl_attrs <ep:dec> <cluster:hex>\n");
+        io_res_err("usage");
+        return -1;
+    }
+    out[0] = '\0';
+    for (uint8_t i = 0; i < count; i++) {
+        if (eps[i].endpoint != ep) continue;
+        for (uint8_t j = 0; j < eps[i].cluster_count; j++) {
+            const hal_zigbee_cluster *cluster = &eps[i].clusters[j];
+
+            if (cluster->cluster_id != cl || cluster->role != HAL_ZIGBEE_ROLE_SERVER) continue;
+            for (uint8_t k = 0; k < cluster->attribute_count; k++) {
+                const hal_zigbee_attribute *attr = &cluster->attributes[k];
+                int written = snprintf(out + used, sizeof(out) - used, "%s0x%04X:%02X:%X",
+                                       used ? "," : "", attr->attribute_id,
+                                       attr->data_type_id, attr->flag);
+
+                if (written < 0 || (size_t)written >= sizeof(out) - used) {
+                    io_res_err("too_many_attrs");
+                    return -1;
+                }
+                used += (size_t)written;
+            }
+            io_res_ok("manufacturer=0x%04X attrs=%s", cluster->manufacturer_code, out);
+            return 0;
+        }
+    }
+    io_res_err("no_cluster");
+    return -1;
 }
 
 static int cmd_zcl_read(int argc, char **argv) {
@@ -203,17 +463,184 @@ static int cmd_zcl_write(int argc, char **argv) {
         io_res_err("attr_not_found ep=%u cluster=0x%04X attr=0x%04X", ep, cl, at);
         return -1;
     }
+    if ((attr->flag & HAL_ATTR_WRITE) == 0) {
+        io_res_err("read_only ep=%u cluster=0x%04X attr=0x%04X", ep, cl, at);
+        return -1;
+    }
 
-    int ret = stub_app_string_to_attribute_value(attr, argv[4]);
+    /* hal_zigbee_attribute.size is uint8_t, so every attribute fits. */
+    uint8_t candidate[UINT8_MAX + 1];
+    hal_zigbee_attribute candidate_attr = *attr;
+
+    memcpy(candidate, attr->value, attr->size);
+    candidate_attr.value = candidate;
+    int ret = stub_app_string_to_attribute_value(&candidate_attr, argv[4]);
     if (ret != 0) {
         fprintf(stderr, "Failed to parse value for attribute (code %d)\n", ret);
         io_res_err("bad_value ep=%u cluster=0x%04X attr=0x%04X", ep, cl, at);
         return -1;
     }
 
-    stub_simulate_zigbee_attribute_write(ep, cl, at);
+    if (stub_simulate_zigbee_attribute_write(
+            ep, cl, at, candidate,
+            hal_zigbee_type_is_string(attr->data_type_id) ?
+            hal_zigbee_attr_encoded_size(attr->data_type_id, candidate, attr->size) :
+            attr->size) !=
+        HAL_ZIGBEE_CMD_PROCESSED) {
+        io_res_err("rejected ep=%u cluster=0x%04X attr=0x%04X", ep, cl, at);
+        return -1;
+    }
     io_res_ok("ep=%d cluster=0x%04X attr=0x%04X value=%s", ep, cl, at, argv[4]);
 
+    return 0;
+}
+
+static int cmd_zcl_write_raw(int argc, char **argv) {
+    uint8_t  ep;
+    uint16_t cl;
+    uint16_t at;
+    uint16_t candidate_len;
+    uint8_t  candidate[256];
+    hal_zigbee_attribute *attr;
+
+    if (argc != 5 || parse_u8_dec(argv[1], &ep) ||
+        parse_u16_hex(argv[2], &cl) || parse_u16_hex(argv[3], &at) ||
+        parse_hex_bytes(argv[4], candidate, sizeof(candidate), &candidate_len)) {
+        io_res_err("bad_args");
+        return -1;
+    }
+    attr = stub_app_find_attr(ep, cl, at);
+    if (attr == NULL) {
+        io_res_err("attr_not_found ep=%u cluster=0x%04X attr=0x%04X", ep, cl, at);
+        return -1;
+    }
+    if (stub_simulate_zigbee_attribute_write(ep, cl, at, candidate, candidate_len) !=
+        HAL_ZIGBEE_CMD_PROCESSED) {
+        io_res_err("rejected ep=%u cluster=0x%04X attr=0x%04X", ep, cl, at);
+        return -1;
+    }
+    io_res_ok("ep=%u cluster=0x%04X attr=0x%04X", ep, cl, at);
+    return 0;
+}
+
+/* zcl_write_undivided <ep> <cluster> <attr>=<hex bytes> ... */
+static int cmd_zcl_write_undivided(int argc, char **argv) {
+    uint8_t        ep;
+    uint16_t       cl;
+    uint8_t        count = (uint8_t)(argc - 3);
+    uint16_t       attribute_ids[STUB_ZIGBEE_MAX_WRITE_RECORDS];
+    uint8_t        values[STUB_ZIGBEE_MAX_WRITE_RECORDS][64];
+    const uint8_t *candidates[STUB_ZIGBEE_MAX_WRITE_RECORDS];
+    uint16_t       candidate_lens[STUB_ZIGBEE_MAX_WRITE_RECORDS];
+
+    if (argc < 4 || argc - 3 > STUB_ZIGBEE_MAX_WRITE_RECORDS ||
+        parse_u8_dec(argv[1], &ep) || parse_u16_hex(argv[2], &cl)) {
+        io_res_err("usage");
+        return -1;
+    }
+    for (uint8_t i = 0; i < count; i++) {
+        char *separator = strchr(argv[3 + i], '=');
+
+        if (separator == NULL) {
+            io_res_err("bad_args");
+            return -1;
+        }
+        *separator = '\0';
+        if (parse_u16_hex(argv[3 + i], &attribute_ids[i]) ||
+            parse_hex_bytes(separator + 1, values[i], sizeof(values[i]),
+                            &candidate_lens[i])) {
+            io_res_err("bad_args");
+            return -1;
+        }
+        candidates[i] = values[i];
+    }
+    if (stub_simulate_zigbee_attribute_write_undivided(
+            ep, cl, count, attribute_ids, candidates, candidate_lens) !=
+        HAL_ZIGBEE_CMD_PROCESSED) {
+        io_res_err("rejected ep=%u cluster=0x%04X", ep, cl);
+        return -1;
+    }
+    io_res_ok("ep=%u cluster=0x%04X records=%u", ep, cl, count);
+    return 0;
+}
+
+static int cmd_zcl_attr_callback(int argc, char **argv) {
+    uint8_t  ep;
+    uint16_t cl;
+    uint16_t at;
+
+    if (argc != 4 || parse_u8_dec(argv[1], &ep) ||
+        parse_u16_hex(argv[2], &cl) || parse_u16_hex(argv[3], &at)) {
+        io_res_err("usage");
+        return -1;
+    }
+    hal_zigbee_attribute *attr = stub_app_find_attr(ep, cl, at);
+    if (attr != NULL)
+        (void)stub_simulate_zigbee_attribute_write(
+            ep, cl, at, attr->value,
+            hal_zigbee_type_is_string(attr->data_type_id) ?
+            hal_zigbee_attr_encoded_size(attr->data_type_id, attr->value, attr->size) :
+            attr->size);
+    io_res_ok("ep=%u cluster=0x%04X attr=0x%04X", ep, cl, at);
+    return 0;
+}
+
+static int cmd_zcl_configure_reporting(int argc, char **argv) {
+    uint8_t  ep;
+    uint16_t cl;
+    uint16_t at;
+    stub_zigbee_report_config_status_t status;
+
+    if (argc != 4 || parse_u8_dec(argv[1], &ep) ||
+        parse_u16_hex(argv[2], &cl) || parse_u16_hex(argv[3], &at)) {
+        io_res_err("usage");
+        return -1;
+    }
+    status = stub_zigbee_configure_reporting(ep, cl, at);
+    if (status == STUB_ZIGBEE_REPORT_CONFIG_UNSUPPORTED_ATTRIBUTE) {
+        io_res_err("unsupported_attribute ep=%u cluster=0x%04X attr=0x%04X", ep, cl, at);
+        return -1;
+    }
+    io_res_ok("ep=%u cluster=0x%04X attr=0x%04X", ep, cl, at);
+    return 0;
+}
+
+static const char *cmd_result_name(hal_zigbee_cmd_result_t result) {
+    switch (result) {
+    case HAL_ZIGBEE_CMD_PROCESSED:    return "PROCESSED";
+
+    case HAL_ZIGBEE_INVALID_VALUE:    return "INVALID_VALUE";
+
+    case HAL_ZIGBEE_MALFORMED_COMMAND: return "MALFORMED_COMMAND";
+
+    case HAL_ZIGBEE_ACTION_DENIED:    return "ACTION_DENIED";
+
+    case HAL_ZIGBEE_CMD_SKIPPED:      return "SKIPPED";
+
+    default:                          return "UNKNOWN";
+    }
+}
+
+/* zcl_foundation <ep> <cluster:hex> <cmd:hex> [payload hex] */
+static int cmd_zcl_foundation(int argc, char **argv) {
+    uint8_t  ep;
+    uint16_t cl;
+    uint16_t command_id;
+    uint8_t  payload[256];
+    uint16_t payload_len = 0;
+    hal_zigbee_cmd_result_t result;
+
+    if ((argc != 4 && argc != 5) || parse_u8_dec(argv[1], &ep) ||
+        parse_u16_hex(argv[2], &cl) || parse_u16_hex(argv[3], &command_id) ||
+        command_id > UINT8_MAX ||
+        (argc == 5 && parse_hex_bytes(argv[4], payload, sizeof(payload), &payload_len))) {
+        io_res_err("usage");
+        return -1;
+    }
+    result = stub_zigbee_foundation_frame(ep, cl, (uint8_t)command_id,
+                                          payload_len > 0 ? payload : NULL, payload_len);
+    io_res_ok("ep=%u cluster=0x%04X cmd=0x%02X result=%s payload_len=%u", ep, cl,
+              command_id, cmd_result_name(result), payload_len);
     return 0;
 }
 
@@ -233,6 +660,57 @@ static int cmd_read_pin(int argc, char **argv) {
     int val = stub_gpio_get_output(pin);
     printf("Pin %d => %d\n", pin, val);
     io_res_ok("pin=%d value=%d", pin, val);
+    return 0;
+}
+
+static int cmd_pin_state(int argc, char **argv) {
+    stub_gpio_pin_state_t state;
+    char *e;
+    long  pin;
+
+    if (argc != 2) {
+        fprintf(stderr, "Usage: pin_state <pin>\n");
+        io_res_err("usage");
+        return -1;
+    }
+    pin = strtol(argv[1], &e, 10);
+    if (*argv[1] == '\0' || *e || pin < 0 || !stub_gpio_pin_state((hal_gpio_pin_t)pin, &state)) {
+        io_res_err("bad_pin=%s", argv[1]);
+        return -1;
+    }
+    io_res_ok("pin=%ld initialized=%u input=%u pull=%u value=%u", pin, state.initialized,
+              state.is_input, (unsigned)state.pull, state.value);
+    return 0;
+}
+
+/* pulse_rate <pin> <mHz> [<gate pin> <gate level>]: counter-only pulse train. */
+static int cmd_pulse_rate(int argc, char **argv) {
+    hal_gpio_pin_t pin;
+    hal_gpio_pin_t gate     = HAL_INVALID_PIN;
+    char *         e        = NULL;
+    unsigned long  rate_mhz = argc >= 3 ? strtoul(argv[2], &e, 10) : 0;
+    int            level    = 0;
+
+    if ((argc != 3 && argc != 5) || e == NULL || *argv[2] == '\0' || *e ||
+        rate_mhz > UINT32_MAX) {
+        io_res_err("usage");
+        return -1;
+    }
+    pin = hal_gpio_parse_pin(argv[1]);
+    if (argc == 5) {
+        gate  = hal_gpio_parse_pin(argv[3]);
+        level = atoi(argv[4]);
+    }
+    if (pin == HAL_INVALID_PIN || (argc == 5 && (gate == HAL_INVALID_PIN ||
+                                                 (level != 0 && level != 1)))) {
+        io_res_err("bad_args");
+        return -1;
+    }
+    if (!stub_gpio_counter_set_rate(pin, (uint32_t)rate_mhz, gate, (uint8_t)level)) {
+        io_res_err("no_generator");
+        return -1;
+    }
+    io_res_ok("pin=%u rate_mhz=%lu", pin, rate_mhz);
     return 0;
 }
 
@@ -280,27 +758,7 @@ static int cmd_zcl_cmd_impl(int argc, char **argv, bool trigger_activity) {
             payload_len);
     }
 
-    const char *result_str;
-    switch (result) {
-    case HAL_ZIGBEE_CMD_PROCESSED:
-        result_str = "PROCESSED";
-        break;
-    case HAL_ZIGBEE_INVALID_VALUE:
-        result_str = "INVALID_VALUE";
-        break;
-    case HAL_ZIGBEE_MALFORMED_COMMAND:
-        result_str = "MALFORMED_COMMAND";
-        break;
-    case HAL_ZIGBEE_ACTION_DENIED:
-        result_str = "ACTION_DENIED";
-        break;
-    case HAL_ZIGBEE_CMD_SKIPPED:
-        result_str = "SKIPPED";
-        break;
-    default:
-        result_str = "UNKNOWN";
-        break;
-    }
+    const char *result_str = cmd_result_name(result);
 
     printf("ZCL command result: %s (ep=%d, cluster=0x%04X, cmd=0x%02X, "
            "payload_len=%d)\n",
@@ -340,6 +798,38 @@ static int cmd_freeze_time(int argc, char **argv) {
     return 0;
 }
 
+/*
+ * Frozen time advances from one task deadline to the next. The main loop runs
+ * at the start, at every deadline and at the end of the step, so tasks fire
+ * at their due time in deadline order, main-loop work (retries, network
+ * steering) happens between them as it would on a device, and the response
+ * follows every effect of the step.
+ */
+static void step_time_through_tasks(uint64_t step) {
+    uint64_t now    = stub_millis_virtual();
+    uint64_t target = now + step;
+    uint64_t due;
+
+    stub_tasks_resume();
+    if (stub_millis_set(now) != 0) {
+        stub_millis_step(step);
+        return;
+    }
+    for (;;) {
+        stub_app_poll();
+        // A poll runs every task due at `now`, so a later deadline must follow.
+        if (!stub_tasks_next_due(&due) || due > target || due <= now) {
+            break;
+        }
+        stub_millis_set(due);
+        now = due;
+    }
+    if (target > now) {
+        stub_millis_set(target);
+        stub_app_poll();
+    }
+}
+
 static int cmd_step_time(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "Usage: step_time <milliseconds>\n");
@@ -353,8 +843,65 @@ static int cmd_step_time(int argc, char **argv) {
         io_res_err("bad_step=%s", argv[1]);
         return -1;
     }
-    stub_millis_step((uint64_t)step);
+    step_time_through_tasks((uint64_t)step);
     io_res_ok("stepped_ms=%ld", step);
+    return 0;
+}
+
+static int cmd_time_advance(int argc, char **argv) {
+    char *e       = NULL;
+    long  advance = argc == 2 ? strtol(argv[1], &e, 10) : -1;
+
+    if (argc != 2 || *argv[1] == '\0' || *e || advance < 0) {
+        io_res_err("usage");
+        return -1;
+    }
+    stub_tasks_pause();
+    stub_millis_step((uint64_t)advance);
+    io_res_ok("advanced_ms=%ld", advance);
+    return 0;
+}
+
+static int cmd_tasks_poll(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    stub_tasks_resume();
+    stub_tasks_poll();
+    io_res_ok(NULL);
+    return 0;
+}
+
+static int cmd_pin_edge(int argc, char **argv) {
+    char *e = NULL;
+    long  pin;
+    long  value;
+    long  after_ms = 0;
+
+    if (argc != 3 && argc != 4) {
+        io_res_err("usage");
+        return -1;
+    }
+    pin = strtol(argv[1], &e, 10);
+    if (*argv[1] == '\0' || *e || pin < 0 || pin >= STUB_GPIO_PIN_LIMIT) {
+        io_res_err("bad_pin=%s", argv[1]);
+        return -1;
+    }
+    value = strtol(argv[2], &e, 10);
+    if (*argv[2] == '\0' || *e || (value != 0 && value != 1)) {
+        io_res_err("bad_value=%s", argv[2]);
+        return -1;
+    }
+    if (argc == 4) {
+        after_ms = strtol(argv[3], &e, 10);
+        if (*argv[3] == '\0' || *e || after_ms < 0) {
+            io_res_err("bad_after_ms=%s", argv[3]);
+            return -1;
+        }
+    }
+    stub_tasks_pause();
+    stub_millis_step((uint64_t)after_ms);
+    stub_gpio_simulate_input((hal_gpio_pin_t)pin, (uint8_t)value);
+    io_res_ok("pin=%ld value=%ld t=%u", pin, value, hal_millis());
     return 0;
 }
 
@@ -377,25 +924,219 @@ static int cmd_set_battery_voltage(int argc, char **argv) {
     return 0;
 }
 
+/* Input pipeline and timing fidelity commands. */
+
+static int parse_ulong_arg(const char *text, unsigned long long max,
+                           unsigned long long *out) {
+    char *end = NULL;
+    unsigned long long value;
+
+    if (*text == '\0' || *text == '-') {
+        return -1;
+    }
+    value = strtoull(text, &end, 0);
+    if (*end != '\0' || value > max) {
+        return -1;
+    }
+    *out = value;
+    return 0;
+}
+
+static int cmd_time_model(int argc, char **argv) {
+    if (argc != 2) {
+        io_res_err("usage");
+        return -1;
+    }
+    if (strcmp(argv[1], "native") == 0) {
+        stub_millis_set_model(STUB_TIME_MODEL_NATIVE);
+    } else if (strcmp(argv[1], "telink") == 0) {
+        stub_millis_set_model(STUB_TIME_MODEL_TELINK);
+    } else {
+        io_res_err("bad_model=%s", argv[1]);
+        return -1;
+    }
+    io_res_ok("model=%s millis=%u", argv[1], hal_millis());
+    return 0;
+}
+
+static int cmd_time_set(int argc, char **argv) {
+    unsigned long long virtual_ms;
+
+    if (argc != 2 || parse_ulong_arg(argv[1], UINT64_MAX / 16000u,
+                                     &virtual_ms) != 0) {
+        io_res_err("usage");
+        return -1;
+    }
+    if (stub_millis_set((uint64_t)virtual_ms) != 0) {
+        io_res_err("not_frozen_or_backwards");
+        return -1;
+    }
+    io_res_ok("virtual_ms=%llu millis=%u", virtual_ms, hal_millis());
+    return 0;
+}
+
+static int cmd_pin_burst(int argc, char **argv) {
+    unsigned long long pin;
+    unsigned long long count;
+
+    if (argc != 3 || parse_ulong_arg(argv[1], STUB_GPIO_PIN_LIMIT - 1, &pin) != 0 ||
+        parse_ulong_arg(argv[2], 1000, &count) != 0) {
+        io_res_err("usage");
+        return -1;
+    }
+    stub_gpio_burst((hal_gpio_pin_t)pin, (uint32_t)count);
+    io_res_ok("pin=%llu count=%llu", pin, count);
+    return 0;
+}
+
+static int cmd_pin_late(int argc, char **argv) {
+    unsigned long long pin;
+    unsigned long long value;
+    unsigned long long lag_ms;
+
+    if (argc != 4 || parse_ulong_arg(argv[1], STUB_GPIO_PIN_LIMIT - 1, &pin) != 0 ||
+        parse_ulong_arg(argv[2], 1, &value) != 0 ||
+        parse_ulong_arg(argv[3], 60000, &lag_ms) != 0) {
+        io_res_err("usage");
+        return -1;
+    }
+    if (stub_millis_set(stub_millis_virtual()) != 0) {
+        io_res_err("not_frozen");
+        return -1;
+    }
+    stub_gpio_simulate_late_input((hal_gpio_pin_t)pin, (uint8_t)value,
+                                  (uint32_t)lag_ms);
+    io_res_ok("pin=%llu value=%llu t=%u", pin, value, hal_millis());
+    return 0;
+}
+
+static int cmd_task_fail(int argc, char **argv) {
+    unsigned long long count;
+
+    if (argc != 2 || parse_ulong_arg(argv[1], UINT32_MAX, &count) != 0) {
+        io_res_err("usage");
+        return -1;
+    }
+    stub_tasks_reject_next((uint32_t)count);
+    io_res_ok("count=%llu", count);
+    return 0;
+}
+
+static int cmd_input_diag(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    io_res_ok("button_schedule_failures=%u timer_schedule_failures=%u "
+              "gpio_edges_dropped=%u zb_button_event_schedule_failures=%u",
+              button_input_schedule_failures(), timer_schedule_failures(),
+              button_input_gpio_edges_dropped(),
+              button_event_cluster_schedule_failures());
+    return 0;
+}
+
+#if FEATURE_PROBE
+
+/*
+ * probe_pin <pin> float | high | low | train <period_us> <high_us>
+ *                 | base <base_ohm> <pull_in_ua>
+ */
+static int cmd_probe_pin(int argc, char **argv) {
+    hal_gpio_probe_id_t id;
+    unsigned long long  first;
+    unsigned long long  second;
+    bool ok = false;
+
+    if (argc < 3 || !stub_gpio_probe_parse(argv[1], &id)) {
+        io_res_err("usage");
+        return -1;
+    }
+    if (argc == 3 && strcmp(argv[2], "float") == 0) {
+        ok = stub_gpio_probe_set_floating(id);
+    } else if (argc == 3 && strcmp(argv[2], "high") == 0) {
+        ok = stub_gpio_probe_set_driven(id, 1);
+    } else if (argc == 3 && strcmp(argv[2], "low") == 0) {
+        ok = stub_gpio_probe_set_driven(id, 0);
+    } else if (argc == 5 && strcmp(argv[2], "train") == 0 &&
+               parse_ulong_arg(argv[3], UINT32_MAX, &first) == 0 &&
+               parse_ulong_arg(argv[4], UINT32_MAX, &second) == 0) {
+        ok = stub_gpio_probe_set_train(id, (uint32_t)first, (uint32_t)second);
+    } else if (argc == 5 && strcmp(argv[2], "base") == 0 &&
+               parse_ulong_arg(argv[3], UINT32_MAX, &first) == 0 &&
+               parse_ulong_arg(argv[4], UINT32_MAX, &second) == 0) {
+        ok = stub_gpio_probe_set_base(id, (uint32_t)first, (uint32_t)second);
+    }
+    if (!ok) {
+        io_res_err("usage");
+        return -1;
+    }
+    io_res_ok("pin=%s", argv[1]);
+    return 0;
+}
+
+static int cmd_probe_pin_info(int argc, char **argv) {
+    hal_gpio_probe_id_t   id;
+    stub_probe_pin_info_t info;
+
+    if (argc != 2 || !stub_gpio_probe_parse(argv[1], &id) ||
+        !stub_gpio_probe_info(id, &info)) {
+        io_res_err("usage");
+        return -1;
+    }
+    io_res_ok("pin=%s level=%u output=%u output_level=%u pull=%u drives=%u "
+              "contention=%u relay_on=%u relay_pull_ins=%u", argv[1], info.level,
+              info.output_enabled, info.output_level, info.pull, info.drives,
+              info.contention, info.relay_on, info.relay_pull_ins);
+    return 0;
+}
+
+#endif
+
 /* Command table */
 static const SimpleReplCommand kCmds[] = {
-    { "machine",             cmd_machine             },
-    { "help",                cmd_help                },
-    { "s",                   cmd_status              },
-    { "status",              cmd_status              },
-    { "net",                 cmd_net                 },
-    { "set_pin",             cmd_pin                 },
-    { "read_pin",            cmd_read_pin            },
-    { "zcl_read",            cmd_zcl_read            },
-    { "zcl_write",           cmd_zcl_write           },
-    { "zcl_list_attrs",      cmd_zcl_list_attrs      },
-    { "zcl_cmd",             cmd_zcl_cmd             },
-    { "zcl_cmd_no_activity", cmd_zcl_cmd_no_activity },
-    { "freeze_time",         cmd_freeze_time         },
-    { "step_time",           cmd_step_time           },
-    { "set_battery_voltage", cmd_set_battery_voltage },
-    { "q",                   cmd_quit                },
-    { "quit",                cmd_quit                },
+    { "machine",                 cmd_machine                 },
+    { "help",                    cmd_help                    },
+    { "s",                       cmd_status                  },
+    { "status",                  cmd_status                  },
+    { "diag",                    cmd_diag                    },
+    { "net",                     cmd_net                     },
+    { "tx_fail",                 cmd_tx_fail                 },
+    { "announce_fail",           cmd_announce_fail           },
+    { "rand_seed",               cmd_rand_seed               },
+    { "nvm_fail",                cmd_nvm_fail                },
+    { "set_pin",                 cmd_pin                     },
+    { "pin_edge",                cmd_pin_edge                },
+    { "read_pin",                cmd_read_pin                },
+    { "pin_state",               cmd_pin_state               },
+    { "pulse_rate",              cmd_pulse_rate              },
+    { "zcl_read",                cmd_zcl_read                },
+    { "zcl_write",               cmd_zcl_write               },
+    { "zcl_write_raw",           cmd_zcl_write_raw           },
+    { "zcl_write_undivided",     cmd_zcl_write_undivided     },
+    { "zcl_attr_callback",       cmd_zcl_attr_callback       },
+    { "zcl_list_attrs",          cmd_zcl_list_attrs          },
+    { "zcl_graph_usage",         cmd_zcl_graph_usage         },
+    { "zcl_clusters",            cmd_zcl_clusters            },
+    { "zcl_attrs",               cmd_zcl_attrs               },
+    { "zcl_configure_reporting", cmd_zcl_configure_reporting },
+    { "zcl_foundation",          cmd_zcl_foundation          },
+    { "zcl_cmd",                 cmd_zcl_cmd                 },
+    { "zcl_cmd_no_activity",     cmd_zcl_cmd_no_activity     },
+    { "freeze_time",             cmd_freeze_time             },
+    { "step_time",               cmd_step_time               },
+    { "time_advance",            cmd_time_advance            },
+    { "tasks_poll",              cmd_tasks_poll              },
+    { "set_battery_voltage",     cmd_set_battery_voltage     },
+    { "time_model",              cmd_time_model              },
+    { "time_set",                cmd_time_set                },
+    { "pin_burst",               cmd_pin_burst               },
+    { "pin_late",                cmd_pin_late                },
+    { "task_fail",               cmd_task_fail               },
+    { "input_diag",              cmd_input_diag              },
+#if FEATURE_PROBE
+    { "probe_pin",               cmd_probe_pin               },
+    { "probe_pin_info",          cmd_probe_pin_info          },
+#endif
+    { "q",                       cmd_quit                    },
+    { "quit",                    cmd_quit                    },
 };
 
 const SimpleReplCommand *commands_table(void) {

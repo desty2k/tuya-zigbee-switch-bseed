@@ -9,9 +9,14 @@ SRC_DIR := $(PROJECT_ROOT)/src
 # Version and board configuration
 VERSION_STR ?= "0.0.0"
 FILE_VERSION ?= 0
-NVM_MIGRATIONS_VERSION ?= $(shell cat ../../NVM_MIGRATIONS_VERSION 2>/dev/null || echo "1")
+NVM_MIGRATIONS_VERSION ?= $(shell cat ../../NVM_MIGRATIONS_VERSION)
+ifeq ($(NVM_MIGRATIONS_VERSION),)
+$(error NVM_MIGRATIONS_VERSION file is missing or empty)
+endif
 
 FIRMWARE_BASENAME ?= tlc_switch
+# Board features; board.mk passes the board's list (src/features.mk).
+include $(SRC_DIR)/features.mk
 DEVICE_TYPE ?= router
 DEBUG ?= 0
 CONFIG_STR ?= ja5osu5g;TS004F-Loginovo;IC4i;SC2u;BTB5;M;
@@ -51,8 +56,13 @@ endif
 
 
 # Compiler and linker flags
+# -fno-jump-tables: at -Os tc32-gcc 4.5.1 emits switch tables as byte-sized
+# relative offsets but dispatches them as 32-bit absolute addresses, so every
+# table-dispatched switch jumps to a bogus address. The linked image is checked
+# for such tables by helper_scripts/check_tc32_jump_tables.py.
 GCC_FLAGS := \
 	-O2 \
+	-fno-jump-tables \
 	-ffunction-sections \
 	-fdata-sections \
 	-Wall \
@@ -89,6 +99,7 @@ DEVICE_DEFS := \
 	-DDEFAULT_CONFIG="$(CONFIG_STR)" \
 	-DIMAGE_TYPE=$(IMAGE_TYPE) \
 	-DHAL_TELINK \
+	$(addprefix -D,$(FEATURE_DEFINES)) \
 	$(TEL_CHIP) 
 
 ifeq ($(DEBUG), 1)
@@ -129,6 +140,7 @@ TELINK_SOURCES := \
 	hal/timer.c \
 	hal/tasks.c \
 	hal/gpio.c \
+	hal/gpio_counter.c \
 	hal/gpio_interrupts.c \
 	hal/nvm.c \
 	hal/zigbee.c \
@@ -139,31 +151,40 @@ TELINK_SOURCES := \
 	libc_polyfills/atoi.c \
 	custom_zcl/zcl_multistate_input.c \
 	custom_zcl/zcl_onoff_configuration.c \
-	custom_zcl/zcl_cover_switch_config.c \
-	patch_sdk/drv_nv.c
+	patch_sdk/drv_nv.c \
+	$(if $(filter probe,$(FEATURES)),hal/gpio_probe.c)
 
 # Common source files (shared with Silicon Labs build)
 COMMON_SOURCES := \
 	$(SRC_DIR)/app.c \
 	$(SRC_DIR)/zigbee/poll_control_cluster.c \
-	$(SRC_DIR)/base_components/button.c \
+	$(SRC_DIR)/base_components/gpio_edge_queue.c \
+	$(SRC_DIR)/base_components/timer_service.c \
+	$(SRC_DIR)/base_components/button_dispatcher.c \
+	$(SRC_DIR)/base_components/button_input.c \
+	$(SRC_DIR)/base_components/gesture_fsm.c \
+	$(SRC_DIR)/base_components/action_mapper.c \
+	$(SRC_DIR)/base_components/diagnostics_service.c \
+	$(SRC_DIR)/device_config/capability_state.c \
 	$(SRC_DIR)/base_components/led.c \
+	$(SRC_DIR)/base_components/indicator_feedback.c \
+	$(SRC_DIR)/base_components/child_lock.c \
 	$(SRC_DIR)/base_components/network_indicator.c \
-	$(SRC_DIR)/base_components/relay.c \
-	$(SRC_DIR)/base_components/battery.c \
+	$(SRC_DIR)/base_components/network_steering.c \
+	$(SRC_DIR)/base_components/relay_driver.c \
+	$(SRC_DIR)/base_components/relay_controller.c \
 	$(SRC_DIR)/device_config/config_nv.c \
-	$(SRC_DIR)/device_config/device_params_nv.c \
+	$(SRC_DIR)/device_config/device_config_service.c \
 	$(SRC_DIR)/device_config/reset.c \
+	$(SRC_DIR)/device_config/feature_wiring.c \
 	$(SRC_DIR)/device_config/config_parser.c \
+	$(SRC_DIR)/device_config/device_composition.c \
 	$(SRC_DIR)/device_config/nvm_migrations.c \
 	$(SRC_DIR)/zigbee/basic_cluster.c \
-	$(SRC_DIR)/zigbee/general_commands.c \
-	$(SRC_DIR)/zigbee/group_cluster.c \
-	$(SRC_DIR)/zigbee/relay_cluster.c \
-	$(SRC_DIR)/zigbee/switch_cluster.c \
-	$(SRC_DIR)/zigbee/cover_switch_cluster.c \
-	$(SRC_DIR)/zigbee/cover_cluster.c \
-	$(SRC_DIR)/zigbee/battery_cluster.c 
+	$(SRC_DIR)/zigbee/device_config_cluster.c \
+	$(SRC_DIR)/zigbee/device_diagnostics_cluster.c \
+	$(SRC_DIR)/zigbee/button_event_cluster.c \
+	$(addprefix $(SRC_DIR)/,$(FEATURE_SOURCES))
 
 # All application sources
 ALL_TELINK_SOURCES := $(TELINK_SOURCES) $(COMMON_SOURCES)
@@ -194,6 +215,20 @@ BIN_FILE := $(BIN_DIR)/$(FIRMWARE_BASENAME).bin
 OTA_FILE := $(BIN_DIR)/$(FIRMWARE_BASENAME).ota
 SIZEDUMMY := $(BUILD_DIR)/sizedummy
 
+# OTA slot limits for 512 KB flash, from telink_tools/sdk/proj/drivers/drv_nv.h
+# (FLASH_OTA_IMAGE_MAX_SIZE). The receiving firmware compares the imageSize of
+# the offered OTA file (headers, padding and CRC included,
+# zigbee/ota/ota.c) with this limit, so the check runs on every packaged
+# .zigbee file (normal, forced and -from_tuya), not on the .bin.
+# - Without bootloader (BOOT_LOADER_MODE 0, this firmware): NV_BASE_ADDRESS
+#   0x34000 - app address 0 = 212992 bytes. This firmware rejects a larger
+#   file, so it fails the build.
+# - With bootloader: (0x6A000 - 0x8000) / 2 = 0x31000 = 200704 bytes. Whether
+#   stock Tuya firmware uses this layout is not established; if it does, it
+#   rejects a larger -from_tuya file. Exceeding it only warns.
+OTA_SLOT_MAX_BYTES := 212992
+TUYA_OTA_SLOT_MAX_BYTES := 200704
+
 # Default target
 all: $(BIN_FILE) $(LST_FILE)
 	@echo "Build complete: $(BIN_FILE)"
@@ -202,6 +237,7 @@ all: $(BIN_FILE) $(LST_FILE)
 $(ELF_FILE): $(ALL_APP_OBJS) sdk-build
 	@echo "Linking $(ELF_FILE)"
 	@$(LD) $(LNK_FLAGS) -T$(LINKER_SCRIPT) $(LIBRARY_PATHS) -o $@ $(ALL_APP_OBJS) $(SDK_OBJS) $(LIBS)
+	@python3 $(PROJECT_ROOT)/helper_scripts/check_tc32_jump_tables.py $@ --objdump $(OBJDUMP) || { rm -f $@; exit 1; }
 
 
 $(LST_FILE): $(ELF_FILE)
@@ -214,6 +250,15 @@ $(BIN_FILE): $(ELF_FILE)
 	@mkdir -p $(dir $@)
 	@$(OBJCOPY) -O binary $< $@
 	@$(SIZE) $<
+	@echo "Binary size: $$(wc -c < $@ | tr -d ' ') bytes"
+
+# Our own code (common/ and telink/ objects) is optimised for size: the image
+# must fit the 200704-byte bootloader-layout OTA slot. This includes the
+# patched SDK NV driver under telink/patch_sdk/. The vendor SDK objects
+# (build/telink/sdk, sdk.mk) stay at -O2; building them with -Os saves about
+# 3 KB more and is held in reserve.
+$(BUILD_DIR)/telink/%.o: GCC_FLAGS += -Os
+$(BUILD_DIR)/common/%.o: GCC_FLAGS += -Os
 
 # Compile Telink-specific C files
 $(BUILD_DIR)/telink/%.o: %.c
@@ -251,7 +296,17 @@ ota: $(BIN_FILE)
 	      --manufacturer-id $(OTA_MANUFACTURER_ID) \
 	      --image-type $(OTA_IMAGE_TYPE) \
 	      $(OTA_VERSION_ARG) \
-	      $(BIN_FILE) $(OTA_FILE); \
+	      $(BIN_FILE) $(OTA_FILE) || exit 1; \
+	    size=$$(wc -c < $(OTA_FILE) | tr -d ' '); \
+	    echo "OTA file size: $$size bytes; OTA slot $(OTA_SLOT_MAX_BYTES) (headroom $$(($(OTA_SLOT_MAX_BYTES) - size))), bootloader-layout slot $(TUYA_OTA_SLOT_MAX_BYTES) (headroom $$(($(TUYA_OTA_SLOT_MAX_BYTES) - size)))"; \
+	    if [ $$size -gt $(OTA_SLOT_MAX_BYTES) ]; then \
+	        echo "ERROR: $(OTA_FILE) exceeds the $(OTA_SLOT_MAX_BYTES)-byte OTA slot"; \
+	        rm -f $(OTA_FILE); \
+	        exit 1; \
+	    fi; \
+	    if [ $$size -gt $(TUYA_OTA_SLOT_MAX_BYTES) ]; then \
+	        echo "WARNING: $(OTA_FILE) exceeds the $(TUYA_OTA_SLOT_MAX_BYTES)-byte bootloader-layout slot; it may not install over stock Tuya firmware"; \
+	    fi; \
 	    echo ''; \
 	fi
 

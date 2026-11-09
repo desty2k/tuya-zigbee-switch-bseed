@@ -23,33 +23,23 @@ help:
 	@echo "  BOARD=MOES_3_GANG_SWITCH DEVICE_TYPE=router make build"
 	@echo ""
 
-# Parse version from VERSION file
-VERSION_FILE_CONTENT := $(shell cat VERSION 2>/dev/null || echo "1.0.0")
+# Version string and OTA file version from the VERSION file
+# (helper_scripts/firmware_version.py documents the encoding). BUILD_NUMBER
+# 1-255 orders development builds between two published ones; published builds
+# use 0.
+BUILD_NUMBER ?= 0
+GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo "")
+FIRMWARE_VERSION_CMD := python3 helper_scripts/firmware_version.py --version-file VERSION --build $(BUILD_NUMBER) --git-hash "$(GIT_HASH)"
+VERSION_STR := $(shell $(FIRMWARE_VERSION_CMD) version-str)
+FILE_VERSION := $(shell $(FIRMWARE_VERSION_CMD) file-version)
+ifeq ($(FILE_VERSION),)
+$(error VERSION or BUILD_NUMBER is invalid: $(shell $(FIRMWARE_VERSION_CMD) file-version 2>&1))
+endif
 
-# Split semantic version
-VERSION_PARTS := $(subst ., ,$(VERSION_FILE_CONTENT))
-VERSION_MAJOR := $(word 1,$(VERSION_PARTS))
-VERSION_MINOR := $(word 2,$(VERSION_PARTS))
-VERSION_PATCH := $(word 3,$(VERSION_PARTS))
-
-# Get git info
-GIT_HASH   := $(shell git rev-parse --short HEAD 2>/dev/null || echo "")
-
-# Limites to 16 characters
-VERSION_STR := $(shell echo "$(VERSION_FILE_CONTENT)-$(GIT_HASH)" | cut -c1-16)
-
-# Zigbee file version 4 bytes are:
-# APP_RELEASE, APP_BUILD, STACK_RELEASE, STACK_BUILD
-# We encode MAJOR.MINOR -> APP_RELEASE (in BCD format)
-# PATCH -> APP_BUILD
-# and STACK_RELEASE fixed to 0x30,
-# STACK_BUILD is depth from main branch, to allow easy updating during feature development
-STACK_BUILD := $(shell git rev-list --count origin/main..HEAD 2>/dev/null || echo "0")
-VERSION_PATCH_HEX := $(shell printf "%02d" $(VERSION_PATCH))
-STACK_BUILD_HEX := $(shell printf "%02X" $(STACK_BUILD))
-FILE_VERSION = 0x$(VERSION_MAJOR)$(VERSION_MINOR)$(VERSION_PATCH_HEX)30$(STACK_BUILD_HEX)
-
-NVM_MIGRATIONS_VERSION := $(shell cat NVM_MIGRATIONS_VERSION 2>/dev/null || echo "1")
+NVM_MIGRATIONS_VERSION := $(shell cat NVM_MIGRATIONS_VERSION)
+ifeq ($(NVM_MIGRATIONS_VERSION),)
+$(error NVM_MIGRATIONS_VERSION file is missing or empty)
+endif
 
 PROJECT_NAME := tlc_switch
 BOARD ?= TUYA_TS0012
@@ -65,6 +55,10 @@ CONFIG_STR := $(shell yq -r .$(BOARD).config_str $(DEVICE_DB_FILE))
 FROM_STOCK_MANUFACTURER_ID := $(shell yq -r .$(BOARD).stock_manufacturer_id $(DEVICE_DB_FILE))
 FROM_STOCK_IMAGE_TYPE := $(shell yq -r .$(BOARD).stock_image_type $(DEVICE_DB_FILE))
 FIRMWARE_IMAGE_TYPE := $(shell yq -r .$(BOARD).firmware_image_type $(DEVICE_DB_FILE))
+# Features compiled into the image (src/features.mk). An empty list is valid;
+# build-firmware reruns the script so that an invalid board fails the build.
+BOARD_FEATURES_CMD := python3 helper_scripts/board_features.py --db $(DEVICE_DB_FILE) features $(BOARD)
+BOARD_FEATURES := $(shell $(BOARD_FEATURES_CMD) 2>/dev/null)
 
 # ==============================================================================
 # Platform Configuration
@@ -88,18 +82,53 @@ endif
 OTA_FILE := $(BIN_PATH)/$(PROJECT_NAME)-$(VERSION_STR).zigbee
 FROM_TUYA_OTA_FILE := $(BIN_PATH)/$(PROJECT_NAME)-$(VERSION_STR)-from_tuya.zigbee
 FORCE_OTA_FILE := $(BIN_PATH)/$(PROJECT_NAME)-$(VERSION_STR)-forced.zigbee
+# File version of the -from_tuya and -forced images: higher than any stock or
+# fork version, so the OTA client always accepts it. Not 0xFFFFFFFF: that is the
+# ZCL uint32 "no value", which zigbee-herdsman 10.x (Zigbee2MQTT 2.14) sends
+# as null in the Image Block Response, and the device then aborts the download.
+MAX_OTA_FILE_VERSION := 0xFFFFFFFE
 
 # Index Files
 Z2M_INDEX_FILE := zigbee2mqtt/ota/index_$(DEVICE_TYPE).json
 Z2M_FORCE_INDEX_FILE := zigbee2mqtt/ota/index_$(DEVICE_TYPE)-FORCE.json
 
+ifeq ($(PLATFORM_PREFIX),telink)
+# OTA packaging must use the board-configured binary rather than Telink defaults.
+OTA_BUILD_ARGS := \
+	VERSION_STR=$(VERSION_STR) \
+	NVM_MIGRATIONS_VERSION=$(NVM_MIGRATIONS_VERSION) \
+	FILE_VERSION=$(FILE_VERSION) \
+	DEVICE_TYPE=$(DEVICE_TYPE) \
+	CONFIG_STR="$(CONFIG_STR)" \
+	FEATURES="$(BOARD_FEATURES)" \
+	IMAGE_TYPE=$(FIRMWARE_IMAGE_TYPE) \
+	BIN_FILE=../../$(BIN_FILE)
+endif
+
 # Main target - builds firmware and generates all OTA files
-build: drop-old-files build-firmware generate-ota-files update-indexes
+build: check-publishable drop-old-files build-firmware generate-ota-files update-indexes
+
+# A probe image is a discovery tool, not a release, and its from_tuya entry matches
+# every stock device with the probe board's manufacturer name: it must never
+# reach the repository OTA indexes, which Zigbee2MQTT installs read directly.
+# Probe boards are built with board/build-firmware board/generate-ota-files
+# and installed from a local index (docs/contribute/porting.md).
+check-publishable:
+	@features="$$($(BOARD_FEATURES_CMD))" || exit 1; \
+	case " $$features " in *" probe "*) \
+		echo "Error: $(BOARD) is a GPIO probe board; it is never added to the OTA indexes." >&2; \
+		echo "Build it with: BOARD=$(BOARD) make board/build-firmware board/generate-ota-files" >&2; \
+		echo "and install it from a local OTA index (docs/contribute/porting.md)." >&2; \
+		exit 1;; \
+	esac
 
 # Build the firmware for the specified board
 build-firmware:
+	@$(BOARD_FEATURES_CMD) > /dev/null
+	@echo "Features of $(BOARD): $(BOARD_FEATURES)"
 ifeq ($(PLATFORM_PREFIX),silabs)
 	$(MAKE) silabs/gen \
+		FEATURES="$(BOARD_FEATURES)" \
 		VERSION_STR=$(VERSION_STR) \
 		NVM_MIGRATIONS_VERSION=$(NVM_MIGRATIONS_VERSION) \
 		FILE_VERSION=$(FILE_VERSION) \
@@ -113,6 +142,7 @@ ifeq ($(PLATFORM_PREFIX),telink)
 	$(MAKE) -C src/telink clean
 endif
 	$(MAKE) -C src/$(PLATFORM_PREFIX) build \
+		FEATURES="$(BOARD_FEATURES)" \
 		VERSION_STR=$(VERSION_STR) \
 		NVM_MIGRATIONS_VERSION=$(NVM_MIGRATIONS_VERSION) \
 		FILE_VERSION=$(FILE_VERSION) \
@@ -132,6 +162,7 @@ generate-ota-files: generate-normal-ota generate-tuya-ota generate-force-ota
 
 generate-normal-ota:
 	$(MAKE) $(PLATFORM_PREFIX)/ota \
+		$(OTA_BUILD_ARGS) \
 		DEVICE_TYPE=$(DEVICE_TYPE) \
 		FILE_VERSION=$(FILE_VERSION) \
 		OTA_IMAGE_TYPE=$(FIRMWARE_IMAGE_TYPE) \
@@ -140,7 +171,8 @@ generate-normal-ota:
 generate-tuya-ota:
 ifneq ($(PLATFORM_PREFIX),silabs)  # Silabs platform does not support Tuya migration OTAs
 	$(MAKE) $(PLATFORM_PREFIX)/ota \
-		OTA_VERSION=0xFFFFFFFF \
+		$(OTA_BUILD_ARGS) \
+		OTA_VERSION=$(MAX_OTA_FILE_VERSION) \
 		DEVICE_TYPE=$(DEVICE_TYPE) \
 		OTA_IMAGE_TYPE=$(FROM_STOCK_IMAGE_TYPE) \
 		OTA_MANUFACTURER_ID=$(FROM_STOCK_MANUFACTURER_ID) \
@@ -149,13 +181,14 @@ endif
 
 generate-force-ota:
 	$(MAKE) $(PLATFORM_PREFIX)/ota \
-		OTA_VERSION=0xFFFFFFFF \
+		$(OTA_BUILD_ARGS) \
+		OTA_VERSION=$(MAX_OTA_FILE_VERSION) \
 		DEVICE_TYPE=$(DEVICE_TYPE) \
 		OTA_IMAGE_TYPE=$(FIRMWARE_IMAGE_TYPE) \
 		OTA_FILE=../../$(FORCE_OTA_FILE)
 
 # Update Zigbee2MQTT index files
-update-indexes:
+update-indexes: check-publishable
 	@python3 $(HELPERS_PATH)/make_z2m_ota_index.py --db_file $(DEVICE_DB_FILE) $(OTA_FILE) $(Z2M_INDEX_FILE) --board $(BOARD)
 ifneq ($(PLATFORM_PREFIX),silabs)  # Silabs platform does not support Tuya migration OTAs
 ifneq ($(FROM_STOCK_MANUFACTURER_ID),null)
@@ -171,5 +204,5 @@ flash_telink: build-firmware
 	@echo "Flashing $(BIN_FILE) to device via $(TLSRPGM_TTY)"
 	$(MAKE) telink/flasher ARGS="-t25 -a 20 --mrst we 0 ../../$(BIN_FILE)"
 
-.PHONY: help build build-firmware drop-old-files generate-ota-files generate-normal-ota generate-tuya-ota generate-force-ota update-indexes clean_z2m_index update_converters update_zha_quirk update_homed_extension update_supported_devices freeze_ota_links
+.PHONY: help build check-publishable build-firmware drop-old-files generate-ota-files generate-normal-ota generate-tuya-ota generate-force-ota update-indexes clean_z2m_index update_converters update_zha_quirk update_homed_extension update_supported_devices freeze_ota_links
 

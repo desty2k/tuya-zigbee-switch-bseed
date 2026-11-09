@@ -18,6 +18,8 @@ help:
 	@echo "    update_supported_devices - Generate supported devices documentation"
 	@echo ""
 	@echo "  Development Utilities:"
+	@echo "    check_management_protocol - Verify generated management protocol metadata"
+	@echo "    check_device_features  - Fail if a board's config uses a feature it does not compile"
 	@echo "    unused_image_type      - Show next available firmware image type ID"
 	@echo ""
 
@@ -51,6 +53,12 @@ update_homed_extension:
 
 update_supported_devices:
 	python3 helper_scripts/make_supported_devices.py device_db.yaml > docs/supported_devices.md 
+
+check_management_protocol:
+	python3 helper_scripts/generate_management_protocol.py --check
+
+check_device_features:
+	python3 helper_scripts/board_features.py check
 
 
 freeze_ota_links:

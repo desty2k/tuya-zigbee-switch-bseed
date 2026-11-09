@@ -6,6 +6,18 @@ BINARY             := $(BUILD_DIR)/stub_device
 
 CONFIG ?= X;Y;BA0u;LA1;SA2u;RA3;IA4;
 
+# The default stub contains every feature but the probe; build_switch_only
+# builds the relay + switch image of a single-relay board, without interlock,
+# and build_probe the image of a GPIO probe board.
+include ../features.mk
+SWITCH_ONLY_FEATURES := relay switch
+PROBE_FEATURES := probe relay switch interlock
+
+NVM_MIGRATIONS_VERSION := $(shell cat ../../NVM_MIGRATIONS_VERSION)
+ifeq ($(NVM_MIGRATIONS_VERSION),)
+$(error NVM_MIGRATIONS_VERSION file is missing or empty)
+endif
+
 # Default target
 help:
 	@echo "Stub Device Build System"
@@ -13,6 +25,9 @@ help:
 	@echo ""
 	@echo "Build Targets:"
 	@echo "  build              - Compile the stub device binary for host testing"
+	@echo "  build_end_device   - Compile the end-device stub binary"
+	@echo "  build_switch_only  - Compile a stub with only the relay and switch features"
+	@echo "  build_probe        - Compile a stub with only the GPIO probe feature"
 	@echo ""
 	@echo "Run Targets:"
 	@echo "  run                - Build and run the stub device in interactive mode"
@@ -36,6 +51,7 @@ SOURCES := \
 	$(SRC_DIR)/zigbee/poll_control_cluster.c \
 	$(SRC_DIR)/stub/main.c \
 	$(SRC_DIR)/stub/hal/gpio.c \
+	$(SRC_DIR)/stub/hal/gpio_counter.c \
 	$(SRC_DIR)/stub/hal/system.c \
 	$(SRC_DIR)/stub/hal/timer.c \
 	$(SRC_DIR)/stub/hal/tasks.c \
@@ -48,23 +64,33 @@ SOURCES := \
 	$(SRC_DIR)/stub/commands.c \
 	$(SRC_DIR)/stub/machine_io.c \
 	$(SRC_DIR)/base_components/led.c \
-	$(SRC_DIR)/base_components/relay.c \
-	$(SRC_DIR)/base_components/button.c \
-	$(SRC_DIR)/base_components/battery.c \
+	$(SRC_DIR)/base_components/indicator_feedback.c \
+	$(SRC_DIR)/base_components/child_lock.c \
+	$(SRC_DIR)/base_components/relay_driver.c \
+	$(SRC_DIR)/base_components/relay_controller.c \
+	$(SRC_DIR)/base_components/gpio_edge_queue.c \
+	$(SRC_DIR)/base_components/timer_service.c \
+	$(SRC_DIR)/base_components/button_dispatcher.c \
+	$(SRC_DIR)/base_components/button_input.c \
+	$(SRC_DIR)/base_components/gesture_fsm.c \
+	$(SRC_DIR)/base_components/action_mapper.c \
+	$(SRC_DIR)/base_components/diagnostics_service.c \
+	$(SRC_DIR)/device_config/capability_state.c \
 	$(SRC_DIR)/base_components/network_indicator.c \
+	$(SRC_DIR)/base_components/network_steering.c \
 	$(SRC_DIR)/device_config/config_parser.c \
+	$(SRC_DIR)/device_config/device_composition.c \
 	$(SRC_DIR)/device_config/config_nv.c \
-	$(SRC_DIR)/device_config/device_params_nv.c \
+	$(SRC_DIR)/device_config/device_config_service.c \
 	$(SRC_DIR)/device_config/reset.c \
+	$(SRC_DIR)/device_config/feature_wiring.c \
 	$(SRC_DIR)/device_config/nvm_migrations.c \
 	$(SRC_DIR)/zigbee/basic_cluster.c \
-	$(SRC_DIR)/zigbee/relay_cluster.c \
-	$(SRC_DIR)/zigbee/switch_cluster.c \
-	$(SRC_DIR)/zigbee/group_cluster.c \
-	$(SRC_DIR)/zigbee/general_commands.c \
-	$(SRC_DIR)/zigbee/cover_switch_cluster.c \
-	$(SRC_DIR)/zigbee/cover_cluster.c \
-	$(SRC_DIR)/zigbee/battery_cluster.c
+	$(SRC_DIR)/zigbee/device_config_cluster.c \
+	$(SRC_DIR)/zigbee/device_diagnostics_cluster.c \
+	$(SRC_DIR)/zigbee/button_event_cluster.c \
+	$(addprefix $(SRC_DIR)/,$(FEATURE_SOURCES)) \
+	$(if $(filter probe,$(FEATURES)),$(SRC_DIR)/stub/hal/gpio_probe.c)
 
 INCLUDES := \
 	-I$(SRC_DIR) \
@@ -72,7 +98,8 @@ INCLUDES := \
 
 CFLAGS := -Wall -Wno-unused-parameter -Wno-unused-variable -g -O0 \
     -DHAL_STUB -DSTACK_BUILD=1001 -D_DEFAULT_SOURCE -DVERSION_STR="0.0.0" \
-	-DNVM_MIGRATIONS_VERSION=1 \
+	-DNVM_MIGRATIONS_VERSION=$(NVM_MIGRATIONS_VERSION) \
+	$(addprefix -D,$(FEATURE_DEFINES)) \
 	-std=c99
 
 LDFLAGS := -lpthread
@@ -89,6 +116,12 @@ build_end_device: $(BUILD_DIR)
 	$(HOST_CC) $(CFLAGS) -DEND_DEVICE $(INCLUDES) $(SOURCES) -o $(BUILD_DIR)/stub_end_device $(LDFLAGS)
 	@echo "End device stub binary built: $(BUILD_DIR)/stub_end_device"
 
+build_switch_only: $(BUILD_DIR)
+	$(MAKE) build FEATURES="$(SWITCH_ONLY_FEATURES)" BINARY=$(BUILD_DIR)/stub_switch_only
+
+build_probe: $(BUILD_DIR)
+	$(MAKE) build FEATURES="$(PROBE_FEATURES)" BINARY=$(BUILD_DIR)/stub_probe
+
 run: build
 	./$(BINARY) --device-config "$(CONFIG)"
 
@@ -96,4 +129,4 @@ clean:
 	rm -rf $(BUILD_DIR)
 	rm -rf ../../stub_nvm_data
 
-.PHONY: help build run test clean
+.PHONY: help build build_end_device build_switch_only build_probe run test clean
