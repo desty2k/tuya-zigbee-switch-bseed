@@ -1,5 +1,17 @@
 # Custom firmware for Tuya Zigbee switches (BSEED fork)
 
+[![Firmware](https://img.shields.io/github/v/tag/desty2k/tuya-zigbee-switch-bseed?include_prereleases&sort=semver&label=firmware&color=blue)](https://github.com/desty2k/tuya-zigbee-switch-bseed/tags)
+[![Tests](https://img.shields.io/github/actions/workflow/status/desty2k/tuya-zigbee-switch-bseed/test.yml?branch=main&label=tests)](https://github.com/desty2k/tuya-zigbee-switch-bseed/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+[![Boards](https://img.shields.io/badge/boards-204-informational)](./docs/supported_devices.md)
+
+[![Telink TLSR8258/8253](https://img.shields.io/badge/Telink-TLSR8258%20%7C%20TLSR8253-6f42c1)](./docs/flashing/telink.md)
+[![Silabs EFR32MG21/MG22](https://img.shields.io/badge/Silabs-EFR32MG21%20%7C%20MG22-d91e2a)](./docs/flashing/silabs.md)
+[![Zigbee2MQTT](https://img.shields.io/badge/Zigbee2MQTT-converter-ffc135)](./docs/updating.md#integration-files)
+[![ZHA](https://img.shields.io/badge/ZHA-quirk-41bdf5)](./docs/updating.md#integration-files)
+[![HOMEd](https://img.shields.io/badge/HOMEd-extension-0a7bbb)](./docs/updating.md#integration-files)
+[![OTA](https://img.shields.io/badge/OTA-from%20stock%20firmware-brightgreen)](./docs/updating.md)
+
 Open firmware for Tuya-style Zigbee wall switches, relay modules, outlets,
 shutter switches and battery remotes on Telink (TLSR8258/TLSR8253) and Silabs
 (EFR32MG21/MG22) chips. It replaces the vendor firmware, fixes its bugs (two
@@ -56,6 +68,7 @@ boards are tested on hardware with 2.x firmware:
 
 | Board | Device | Stock model |
 | --- | --- | --- |
+| `SWITCH_BSEED_TS0726_3GANG` | BSEED Echo Click / Scale 3-gang switch | TS0726 `_TZ3002_iedhxgyi` |
 | `SWITCH_BSEED_TS0726_4GANG` | BSEED Echo Click / Scale 4-gang switch | TS0726 `_TZ3002_pzao9ls1` |
 | `OUTLET_BSEED_TS011F_PM_DRZLXJNE` | BSEED outlet with power metering | TS011F `_TZ3210_drzlxjne` |
 | `COVER_BSEED_TS130F_VSJ5O7DM` | BSEED shutter switch | TS130F `_TZ3000_vsj5o7dm` |
@@ -63,6 +76,15 @@ boards are tested on hardware with 2.x firmware:
 All other boards are published release candidates, untested on hardware in
 2.x. The full generated list is
 [docs/supported_devices.md](./docs/supported_devices.md).
+
+## Quick start
+
+1. Point Zigbee2MQTT at the fork's OTA index and install the fork's converter
+   ([updating.md](./docs/updating.md)).
+2. Check for an update on the device and install it; a stock Telink device is
+   converted over the air.
+3. Pair it again if it left the network, then set it up from its Zigbee2MQTT
+   page ([configuration.md](./docs/usage/configuration.md)).
 
 ## Installation
 

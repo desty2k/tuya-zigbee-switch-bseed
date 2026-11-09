@@ -11,8 +11,10 @@ Limits of the current 2.x firmware. Report new problems on the fork's
 - Silabs (EFR32MG21/MG22) builds are not hardware-tested in 2.x. Silabs devices
   cannot be converted from stock firmware over the air, and the power meter
   (`E` token) is Telink only.
-- Hardware testing of 2.x has been short: no board has run a multi-day test,
-  a series of power cuts or long coordinator outages yet
+- Hardware testing of 2.x covers everyday use: the tested 4-gang, outlet and shutter boards ran
+  2.0.0-rc.5 for two to three weeks, and a 3-gang ran the 2.0.0-rc.6 stack-fault
+  reset for more than two days, without a reboot or network loss. No board has
+  been through a series of power cuts or long coordinator outages yet
   ([open_work.md](./contribute/open_work.md#hardware-tests-not-run)).
 - `MODULE_SONOFF_ZBMINIL2` (EFR32MG22) does not build in 2.x (its RAM
   overflows) and has no 2.x image; it is not part of the release.
